@@ -205,7 +205,7 @@ class AudioLoop:
         MAX_UTTERANCE_DURATION_SECONDS = 2.5
         SILENCE_THRESHOLD_SECONDS = 0.4
         QUEUE_POLL_INTERVAL_SECONDS = 0.02 
-        MIN_BUFFER_FOR_SILENCE_SEND_BYTES = int(0.3 * 16000 * 2) # Approx 0.3 seconds of audio
+        # MIN_BUFFER_FOR_SILENCE_SEND_BYTES = int(0.3 * 16000 * 2) # Removing this concept for now
         
         MAX_BUFFER_SIZE_BYTES = int(MAX_UTTERANCE_DURATION_SECONDS * 16000 * 2)
 
@@ -252,12 +252,12 @@ class AudioLoop:
                 if not chunk_received_in_this_iteration and internal_audio_buffer:
                     current_time = time.monotonic()
                     if (current_time - last_audio_received_time) > SILENCE_THRESHOLD_SECONDS:
-                        if len(internal_audio_buffer) >= MIN_BUFFER_FOR_SILENCE_SEND_BYTES:
-                            # print(f"AudioLoop: listen_audio: Silence detected ({SILENCE_THRESHOLD_SECONDS}s) with SUFFICIENT audio ({len(internal_audio_buffer)} bytes vs min {MIN_BUFFER_FOR_SILENCE_SEND_BYTES} bytes). Triggering send.") # Too verbose
-                            send_audio_now = True
-                        else: 
-                            # print(f"AudioLoop: listen_audio: Silence detected ({SILENCE_THRESHOLD_SECONDS}s) but audio buffer ({len(internal_audio_buffer)} bytes) is BELOW MINIMUM ({MIN_BUFFER_FOR_SILENCE_SEND_BYTES} bytes). Not sending yet.") # Too verbose
-                            pass
+                        # if len(internal_audio_buffer) >= MIN_BUFFER_FOR_SILENCE_SEND_BYTES: # Condition removed
+                        # print(f"AudioLoop: listen_audio: Silence detected ({SILENCE_THRESHOLD_SECONDS}s) with SUFFICIENT audio ({len(internal_audio_buffer)} bytes vs min ...). Triggering send.")
+                        print(f"AudioLoop: listen_audio: Silence detected ({SILENCE_THRESHOLD_SECONDS}s). Buffer has {len(internal_audio_buffer)} bytes. Triggering send.")
+                        send_audio_now = True
+                        # else: 
+                            # print(f"AudioLoop: listen_audio: Silence detected ({SILENCE_THRESHOLD_SECONDS}s) but audio buffer ({len(internal_audio_buffer)} bytes) is BELOW MINIMUM (...). Not sending yet.")
                 
                 if send_audio_now and internal_audio_buffer:
                     # print(f"AudioLoop: listen_audio: Preparing to send {len(internal_audio_buffer)} accumulated bytes.") # Too verbose
