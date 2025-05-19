@@ -1,1 +1,11 @@
-requests>=2.25.0 
+requests>=2.25.0
+google-genai
+opencv-python
+pyaudio
+pillow
+mss
+streamlit
+streamlit-webrtc
+python-dotenv
+numpy
+librosa 
