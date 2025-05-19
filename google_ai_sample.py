@@ -68,6 +68,7 @@ tools = [
 CONFIG = types.LiveConnectConfig(
     response_modalities=[
         "AUDIO",
+        "TEXT",
     ],
     speech_config=types.SpeechConfig(
         voice_config=types.VoiceConfig(
@@ -78,13 +79,19 @@ CONFIG = types.LiveConnectConfig(
 )
 
 class AudioLoop:
-    def __init__(self, user_text_input_queue=None, model_text_output_queue=None):
+    def __init__(self, user_text_input_queue=None, model_text_output_queue=None, use_pyaudio=True):
         self.user_text_input_queue = user_text_input_queue
         self.model_text_output_queue = model_text_output_queue
+        self.use_pyaudio = use_pyaudio
         
-        self.pya = pyaudio.PyAudio() # Instance-specific PyAudio
+        self.pya = None
+        if self.use_pyaudio:
+            self.pya = pyaudio.PyAudio()
+        
         self.audio_in_queue = None 
-        self.out_queue = None      
+        self.out_queue = asyncio.Queue(maxsize=50)
+        self.user_text_input_queue_internal = None
+        self.model_text_output_queue_internal = None
 
         self.session = None
         self.audio_stream = None 
@@ -95,7 +102,7 @@ class AudioLoop:
         await self._shutdown_event.wait()  
         print("AudioLoop: _shutdown_monitor: Shutdown signaled.")
 
-        if self.audio_stream:  
+        if self.use_pyaudio and self.audio_stream:
             print("AudioLoop: _shutdown_monitor: Attempting to stop microphone stream (self.audio_stream).")
             try:
                 is_active = await asyncio.wait_for(asyncio.to_thread(self.audio_stream.is_active), timeout=1.0)
@@ -151,6 +158,7 @@ class AudioLoop:
 
     async def send_realtime(self):
         print("AudioLoop: send_realtime started.")
+        last_audio_chunk_sent = False
         try:
             while not self._shutdown_event.is_set():
                 if not self.out_queue:
@@ -159,10 +167,18 @@ class AudioLoop:
                 try:
                     msg = await asyncio.wait_for(self.out_queue.get(), timeout=0.5)
                     if msg is None: 
-                        print("AudioLoop: send_realtime received None from out_queue, exiting.")
-                        break
+                        print("AudioLoop: send_realtime received None from out_queue.")
+                        if last_audio_chunk_sent:
+                            print("AudioLoop: send_realtime - Audio stream ended. Gemini should process received audio.")
+                        else:
+                            print("AudioLoop: send_realtime - No audio was sent before None received.")
+                        break # Exit loop after handling None
+
                     if self.session and not self._shutdown_event.is_set():
+                        data_length = len(msg.inline_data.data) if msg.inline_data else 0
+                        print(f"AudioLoop: send_realtime attempting to send {data_length} audio bytes to Gemini.")
                         await self.session.send_realtime_input(media=msg.inline_data)
+                        last_audio_chunk_sent = True 
                     elif self._shutdown_event.is_set():
                         print("AudioLoop: Shutdown signaled in send_realtime, not sending.")
                         break
@@ -177,6 +193,13 @@ class AudioLoop:
 
     async def listen_audio(self):
         print("AudioLoop: listen_audio started.")
+        if not self.use_pyaudio:
+            print("AudioLoop: listen_audio disabled as use_pyaudio is False.")
+            while not self._shutdown_event.is_set():
+                await asyncio.sleep(0.5)
+            print("AudioLoop: listen_audio finished (noop).")
+            return
+
         try:
             mic_info = await asyncio.to_thread(self.pya.get_default_input_device_info)
             self.audio_stream = await asyncio.to_thread(
@@ -253,9 +276,12 @@ class AudioLoop:
                     continue
                 try:
                     response_message_iterator = self.session.receive()
+                    print("AudioLoop: receive_audio - Waiting for message from session.receive()...")
                     response_message = await asyncio.wait_for(response_message_iterator.__anext__(), timeout=0.5)
+                    print(f"AudioLoop: receive_audio - Received message from Gemini: {response_message}") # Log entire message
                     
                     if server_tool_call := response_message.tool_call:
+                        print(f"AudioLoop: receive_audio - Detected tool call: {server_tool_call}")
                         if not self._shutdown_event.is_set():
                              await handle_tool_call(self.session, server_tool_call)
                         continue
@@ -265,13 +291,17 @@ class AudioLoop:
                             for part in model_turn_content.parts:
                                 if self._shutdown_event.is_set(): break
                                 if part.text:
+                                    print(f"AudioLoop: receive_audio - Got text part: '{part.text[:100]}...' ({len(part.text)} chars)")
                                     if self.model_text_output_queue:
                                         self.model_text_output_queue.put_nowait(part.text)
                                     else: 
                                         if not self._shutdown_event.is_set(): print(part.text, end="", flush=True)
                                 elif part.inline_data and part.inline_data.data:
+                                    audio_data_len = len(part.inline_data.data)
+                                    print(f"AudioLoop: receive_audio - Got inline_data (audio) part: {audio_data_len} bytes.")
                                     if self.audio_in_queue:
                                         self.audio_in_queue.put_nowait(part.inline_data.data)
+                                        print(f"AudioLoop: receive_audio - Queued {audio_data_len} audio bytes to audio_in_queue.")
                                 elif exec_result := part.code_execution_result:
                                     outcome_str = exec_result.outcome if exec_result.outcome else "UNSPECIFIED"
                                     output_str = exec_result.output if exec_result.output else ""
@@ -284,6 +314,7 @@ class AudioLoop:
                                 pass 
                         
                         if server_content.interrupted:
+                            print("AudioLoop: receive_audio - Playback Interrupted by Server Signal.")
                             msg = "\n[Playback Interrupted by Server Signal]"
                             if self.model_text_output_queue:
                                 self.model_text_output_queue.put_nowait(msg)
@@ -297,19 +328,41 @@ class AudioLoop:
                     continue 
                 except StopAsyncIteration: 
                     if not self._shutdown_event.is_set(): 
-                        print("AudioLoop: session.receive() iterator finished unexpectedly.")
+                        print("AudioLoop: receive_audio - session.receive() iterator finished unexpectedly. Signaling shutdown.")
                         self._shutdown_event.set() 
+                    else:
+                        print("AudioLoop: receive_audio - session.receive() iterator finished during shutdown.")
                     break
                 except Exception as e:
                     if not self._shutdown_event.is_set():
-                        print(f"AudioLoop: Error in receive_audio: {e}")
+                        print(f"AudioLoop: receive_audio - Error in main loop: {e}. Signaling shutdown.")
+                        traceback.print_exc() # Add full traceback for unexpected errors
                         self._shutdown_event.set() 
+                    else:
+                        print(f"AudioLoop: receive_audio - Error during shutdown: {e}")
                     break 
         finally:
             print("AudioLoop: receive_audio finished.")
 
     async def play_audio(self):
         print("AudioLoop: play_audio started.")
+        if not self.use_pyaudio:
+            print("AudioLoop: play_audio disabled as use_pyaudio is False.")
+            while not self._shutdown_event.is_set():
+                if self.audio_in_queue:
+                    try:
+                        item = await asyncio.wait_for(self.audio_in_queue.get(), timeout=0.1)
+                        if item is None: break
+                        self.audio_in_queue.task_done()
+                    except asyncio.TimeoutError:
+                        continue
+                    except asyncio.QueueEmpty:
+                        await asyncio.sleep(0.1)
+                else:
+                    await asyncio.sleep(0.1)
+            print("AudioLoop: play_audio finished (noop and draining).")
+            return
+
         stream = None 
         try:
             stream = await asyncio.to_thread(
@@ -369,20 +422,28 @@ class AudioLoop:
                 self.session = session
                 print("AudioLoop: Gemini session connected.")
 
-                if self.user_text_input_queue is None: self.user_text_input_queue = asyncio.Queue()
-                if self.model_text_output_queue is None: self.model_text_output_queue = asyncio.Queue()
+                if self.user_text_input_queue is None:
+                    self.user_text_input_queue_internal = asyncio.Queue()
+                    self.user_text_input_queue = self.user_text_input_queue_internal
+                if self.model_text_output_queue is None:
+                    self.model_text_output_queue_internal = asyncio.Queue()
+                    self.model_text_output_queue = self.model_text_output_queue_internal
+                
                 self.audio_in_queue = asyncio.Queue()
-                self.out_queue = asyncio.Queue(maxsize=50) 
 
                 async with asyncio.TaskGroup() as tg:
                     print("AudioLoop: Creating tasks within TaskGroup...")
                     self._tasks.append(tg.create_task(self._shutdown_monitor(), name="shutdown_monitor"))
                     self._tasks.append(tg.create_task(self.send_text_from_queue(), name="send_text"))
                     self._tasks.append(tg.create_task(self.send_realtime(), name="send_realtime"))
-                    self._tasks.append(tg.create_task(self.listen_audio(), name="listen_audio"))
                     self._tasks.append(tg.create_task(self.receive_audio(), name="receive_audio"))
-                    self._tasks.append(tg.create_task(self.play_audio(), name="play_audio"))
-                    print("AudioLoop: All tasks created.")
+
+                    if self.use_pyaudio:
+                        self._tasks.append(tg.create_task(self.listen_audio(), name="listen_audio"))
+                        self._tasks.append(tg.create_task(self.play_audio(), name="play_audio"))
+                    else:
+                        print("AudioLoop: PyAudio input/output tasks (listen_audio, play_audio) NOT created. Expecting WebRTC for I/O.")
+                    print("AudioLoop: All relevant tasks created.")
                 
                 print("AudioLoop: TaskGroup finished naturally (all tasks completed).")
 
@@ -401,10 +462,14 @@ class AudioLoop:
             self._shutdown_event.set() 
 
             print("AudioLoop: Placing sentinels on all queues to unblock any waiting tasks...")
-            if self.user_text_input_queue: self.user_text_input_queue.put_nowait(None)
+            if self.user_text_input_queue_internal: self.user_text_input_queue_internal.put_nowait(None)
             if self.audio_in_queue: self.audio_in_queue.put_nowait(None)
-            if self.out_queue: self.out_queue.put_nowait(None)
-            if self.model_text_output_queue: self.model_text_output_queue.put_nowait(None) 
+            if self.out_queue and self.use_pyaudio:
+                self.out_queue.put_nowait(None)
+            elif self.out_queue and not self.use_pyaudio:
+                print("AudioLoop: WebRTC mode, out_queue is fed externally. External producer should send None to stop send_realtime.")
+
+            if self.model_text_output_queue_internal: self.model_text_output_queue_internal.put_nowait(None)
             
             print("AudioLoop: Waiting briefly (e.g., 1s) for tasks to finalize based on event and sentinels...")
             await asyncio.sleep(1.0) 
@@ -424,14 +489,17 @@ class AudioLoop:
                 print("AudioLoop: Gemini session should be closed by 'async with' context manager.")
                 self.session = None 
             
-            print("AudioLoop: Terminating self.pya (PyAudio instance)...") # Changed print message
-            try:
-                if self.pya: # Check if self.pya exists
+            if self.use_pyaudio and self.pya:
+                print("AudioLoop: Terminating self.pya (PyAudio instance)...")
+                try:
                     self.pya.terminate()
                     print("AudioLoop: self.pya (PyAudio instance) terminated successfully.")
-            except Exception as e:
-                print(f"AudioLoop: Error terminating self.pya (PyAudio instance): {e}")
-            self.pya = None # Clear the reference
+                except Exception as e:
+                    print(f"AudioLoop: Error terminating self.pya (PyAudio instance): {e}")
+                self.pya = None 
+            elif not self.use_pyaudio:
+                print("AudioLoop: PyAudio was not used, no termination needed.")
+
             print("AudioLoop: run method finished cleanup.")
 
 
@@ -482,16 +550,17 @@ if __name__ == "__main__":
     model_q = asyncio.Queue()
     loop_task = None 
     
-    main_loop = AudioLoop(user_text_input_queue=user_q, model_text_output_queue=model_q)
+    main_loop = AudioLoop(user_text_input_queue=user_q, model_text_output_queue=model_q, use_pyaudio=True)
     
     async def console_input_sender(queue):
+        loop = asyncio.get_event_loop()
         while True:
             try:
-                text = await asyncio.to_thread(input, "message (type 'q' to quit) > ")
+                text = await loop.run_in_executor(None, input, "message (type 'q' to quit) > ")
                 if text.lower() == 'q':
-                    await queue.put(None) 
+                    if queue: await queue.put(None) 
                     break
-                await queue.put(text)
+                if queue: await queue.put(text)
             except EOFError: 
                 await queue.put(None)
                 break
