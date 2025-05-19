@@ -7,6 +7,7 @@ from streamlit_webrtc import webrtc_streamer, AudioProcessorBase, WebRtcMode
 import numpy as np
 import librosa
 import av # For av.AudioFrame
+# import pyaudio # No longer needed here for normal operation
 
 # Ensure PyAudio is terminated when Streamlit shuts down (this is a bit tricky with Streamlit's execution model)
 # A cleaner way would be to manage the PyAudio instance within AudioLoop and ensure its cleanup.
@@ -49,92 +50,95 @@ if 'audioloop_running' not in st.session_state:
     st.session_state.stop_requested = False
 
 TARGET_SAMPLE_RATE = 16000 # For Gemini
+# PYAUDIO_FORMAT = pyaudio.paInt16 # No longer needed
+# PYAUDIO_CHANNELS = 1 # No longer needed
 
 class WebRTCAudioRelay(AudioProcessorBase):
-    def __init__(self, output_queue: asyncio.Queue):
-        self.output_queue = output_queue
+    def __init__(self, output_queue: asyncio.Queue): # Reverted: output_queue is required
+        self.output_queue = output_queue # Reverted: store the output_queue
         self.last_sample_rate = None
         self.last_channels = None
-        print(f"WebRTCAudioRelay __init__ called. Output queue type: {type(self.output_queue)}")
+        # self._pyaudio_instance = None # Removed
+        # self._output_stream = None # Removed
+        print(f"WebRTCAudioRelay __init__ called. Output queue type: {type(self.output_queue)}") # Reverted message
+        # Removed PyAudio initialization for passthrough test
 
     async def recv_queued(self, frames: list[av.AudioFrame], bundled_frames: list[av.AudioFrame] | None = None):
-        # This method is called by streamlit-webrtc with a list of AudioFrames
-        # Accumulate all processed audio from this batch of frames into one bytearray
         all_processed_bytes_for_this_callback = bytearray()
 
         if not frames:
-            return
+            return # Return None or an empty list, AudioProcessorBase expects a list
 
-        print(f"WebRTCAudioRelay: recv_queued called with {len(frames)} frames.") # Log number of frames received
+        print(f"WebRTCAudioRelay: recv_queued called with {len(frames)} frames.") # Restored original log
 
         for frame_idx, frame in enumerate(frames):
-            # print(f"WebRTCAudioRelay: Processing frame {frame_idx+1}/{len(frames)} | SR: {frame.sample_rate}, CH: {frame.layout.nb_channels}, Samples: {frame.samples}")
             if self.last_sample_rate != frame.sample_rate or self.last_channels != frame.layout.nb_channels:
-                print(f"WebRTCAudioRelay: Audio properties changed: SR={frame.sample_rate}, Channels={frame.layout.nb_channels}")
+                print(f"WebRTCAudioRelay: Audio properties changed: SR={frame.sample_rate}, Channels={frame.layout.nb_channels}") # Restored original log
                 self.last_sample_rate = frame.sample_rate
                 self.last_channels = frame.layout.nb_channels
 
-            raw_audio_nd = frame.to_ndarray() 
+            raw_audio_nd = frame.to_ndarray()
             float_audio_nd = raw_audio_nd.astype(np.float32) / 32768.0
             
             mono_audio = None
             if frame.layout.nb_channels > 1:
-                if float_audio_nd.ndim == 2 and float_audio_nd.shape[0] == 1: 
+                if float_audio_nd.ndim == 2 and float_audio_nd.shape[0] == 1:
                     interleaved_samples = float_audio_nd[0]
                     try:
                         reshaped_for_librosa = interleaved_samples.reshape((-1, frame.layout.nb_channels)).T
                         mono_audio = librosa.to_mono(reshaped_for_librosa)
                     except Exception as e:
-                        # print(f"WebRTCAudioRelay: Error during stereo to mono conversion (reshape/to_mono): {e}. Shape: {interleaved_samples.shape}, Channels: {frame.layout.nb_channels}")
-                        mono_audio = np.array([], dtype=np.float32) # Empty array on error
-                elif float_audio_nd.ndim == 2 and float_audio_nd.shape[0] == frame.layout.nb_channels: 
+                        # print(f"WebRTCAudioRelay: Error during stereo to mono conversion (reshape/to_mono): {e}...") # Original commented print
+                        mono_audio = np.array([], dtype=np.float32)
+                elif float_audio_nd.ndim == 2 and float_audio_nd.shape[0] == frame.layout.nb_channels:
                     try:
                         mono_audio = librosa.to_mono(float_audio_nd)
                     except Exception as e:
-                        # print(f"WebRTCAudioRelay: Error during stereo to mono conversion (to_mono direct): {e}. Shape: {float_audio_nd.shape}")
+                        # print(f"WebRTCAudioRelay: Error during stereo to mono conversion (to_mono direct): {e}...") # Original commented print
                         mono_audio = np.array([], dtype=np.float32)
                 else:
-                    # print(f"WebRTCAudioRelay: Unexpected audio array shape for stereo: {float_audio_nd.shape}, channels: {frame.layout.nb_channels}. Skipping frame processing.")
+                    # print(f"WebRTCAudioRelay: Unexpected audio array shape for stereo: {float_audio_nd.shape}...") # Original commented print
                     mono_audio = np.array([], dtype=np.float32)
             elif frame.layout.nb_channels == 1:
-                if float_audio_nd.ndim == 2 and float_audio_nd.shape[0] == 1: 
+                if float_audio_nd.ndim == 2 and float_audio_nd.shape[0] == 1:
                     mono_audio = float_audio_nd[0]
-                elif float_audio_nd.ndim == 1: 
+                elif float_audio_nd.ndim == 1:
                      mono_audio = float_audio_nd
                 else:
-                    # print(f"WebRTCAudioRelay: Unexpected mono audio array shape: {float_audio_nd.shape}. Skipping frame processing.")
+                    # print(f"WebRTCAudioRelay: Unexpected mono audio array shape: {float_audio_nd.shape}...") # Original commented print
                     mono_audio = np.array([], dtype=np.float32)
             else:
-                # print(f"WebRTCAudioRelay: Unknown channel layout: {frame.layout.nb_channels}. Skipping frame processing.")
+                # print(f"WebRTCAudioRelay: Unknown channel layout: {frame.layout.nb_channels}...") # Original commented print
                 mono_audio = np.array([], dtype=np.float32)
 
-            if mono_audio.size == 0: # If mono_audio is empty (e.g. due to error or unexpected format)
-                # print(f"WebRTCAudioRelay: Mono audio is empty for frame {frame_idx+1}. Skipping resampling and conversion for this frame.")
-                continue # Skip to the next frame
+            if mono_audio.size == 0:
+                continue
 
             if frame.sample_rate != TARGET_SAMPLE_RATE:
                 try:
                     resampled_audio = librosa.resample(mono_audio, orig_sr=frame.sample_rate, target_sr=TARGET_SAMPLE_RATE)
                 except Exception as e:
-                    # print(f"WebRTCAudioRelay: Error during resampling: {e}. Mono audio size: {mono_audio.size}, SR: {frame.sample_rate}")
-                    continue # Skip this frame on resampling error
+                    # print(f"WebRTCAudioRelay: Error during resampling: {e}...") # Original commented print
+                    continue
             else:
                 resampled_audio = mono_audio
             
             int16_audio = (np.clip(resampled_audio, -1.0, 1.0) * 32767).astype(np.int16)
             all_processed_bytes_for_this_callback.extend(int16_audio.tobytes())
         
-        # After processing all frames in this batch, put the consolidated audio onto the queue
         if all_processed_bytes_for_this_callback:
             try:
-                self.output_queue.put_nowait(bytes(all_processed_bytes_for_this_callback)) 
-                print(f"WebRTCAudioRelay: Queued one consolidated block of {len(all_processed_bytes_for_this_callback)} bytes. Output queue size: {self.output_queue.qsize()}") # Log size of queued block
+                self.output_queue.put_nowait(bytes(all_processed_bytes_for_this_callback))
+                print(f"WebRTCAudioRelay: Queued one consolidated block of {len(all_processed_bytes_for_this_callback)} bytes. Output queue size: {self.output_queue.qsize()}") # Restored original log
             except asyncio.QueueFull:
                 print("WebRTCAudioRelay: Output queue is full. Discarding consolidated audio block.")
             except Exception as e:
                 print(f"WebRTCAudioRelay: Error putting consolidated audio to queue: {e}")
-        # else:
-            # print("WebRTCAudioRelay: No audio bytes processed in this callback, not queuing anything.")
+        return [] # Must return a list for AudioProcessorBase
+
+    def __del__(self):
+        print("WebRTCAudioRelay __del__ called.") # Reverted message
+        # Removed PyAudio cleanup for passthrough test
 
 # Factory creator for WebRTCAudioRelay
 def create_webrtc_audio_relay_factory(queue_instance: asyncio.Queue):
