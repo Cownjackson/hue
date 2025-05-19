@@ -54,26 +54,23 @@ TARGET_SAMPLE_RATE = 16000 # For Gemini
 # PYAUDIO_CHANNELS = 1 # No longer needed
 
 class WebRTCAudioRelay(AudioProcessorBase):
-    def __init__(self, output_queue: asyncio.Queue): # Reverted: output_queue is required
-        self.output_queue = output_queue # Reverted: store the output_queue
+    def __init__(self, output_queue: asyncio.Queue): 
+        self.output_queue = output_queue 
         self.last_sample_rate = None
         self.last_channels = None
-        # self._pyaudio_instance = None # Removed
-        # self._output_stream = None # Removed
-        print(f"WebRTCAudioRelay __init__ called. Output queue type: {type(self.output_queue)}") # Reverted message
-        # Removed PyAudio initialization for passthrough test
+        # print(f"WebRTCAudioRelay __init__ called. Output queue type: {type(self.output_queue)}") # Less verbose
 
     async def recv_queued(self, frames: list[av.AudioFrame], bundled_frames: list[av.AudioFrame] | None = None):
         all_processed_bytes_for_this_callback = bytearray()
 
         if not frames:
-            return # Return None or an empty list, AudioProcessorBase expects a list
+            return [] 
 
-        print(f"WebRTCAudioRelay: recv_queued called with {len(frames)} frames.") # Restored original log
+        # print(f"WebRTCAudioRelay: recv_queued called with {len(frames)} frames.") # Too verbose for normal operation
 
         for frame_idx, frame in enumerate(frames):
             if self.last_sample_rate != frame.sample_rate or self.last_channels != frame.layout.nb_channels:
-                print(f"WebRTCAudioRelay: Audio properties changed: SR={frame.sample_rate}, Channels={frame.layout.nb_channels}") # Restored original log
+                # print(f"WebRTCAudioRelay: Audio properties changed: SR={frame.sample_rate}, Channels={frame.layout.nb_channels}") # Informative but can be verbose
                 self.last_sample_rate = frame.sample_rate
                 self.last_channels = frame.layout.nb_channels
 
@@ -129,16 +126,16 @@ class WebRTCAudioRelay(AudioProcessorBase):
         if all_processed_bytes_for_this_callback:
             try:
                 self.output_queue.put_nowait(bytes(all_processed_bytes_for_this_callback))
-                print(f"WebRTCAudioRelay: Queued one consolidated block of {len(all_processed_bytes_for_this_callback)} bytes. Output queue size: {self.output_queue.qsize()}") # Restored original log
+                # print(f"WebRTCAudioRelay: Queued one consolidated block of {len(all_processed_bytes_for_this_callback)} bytes. Output queue size: {self.output_queue.qsize()}") # Too verbose
             except asyncio.QueueFull:
-                print("WebRTCAudioRelay: Output queue is full. Discarding consolidated audio block.")
+                print("WebRTCAudioRelay: Output queue is full. Discarding consolidated audio block.") # Keep this error
             except Exception as e:
-                print(f"WebRTCAudioRelay: Error putting consolidated audio to queue: {e}")
-        return [] # Must return a list for AudioProcessorBase
+                print(f"WebRTCAudioRelay: Error putting consolidated audio to queue: {e}") # Keep this error
+        return [] 
 
     def __del__(self):
-        print("WebRTCAudioRelay __del__ called.") # Reverted message
-        # Removed PyAudio cleanup for passthrough test
+        # print("WebRTCAudioRelay __del__ called.") # Less verbose
+        pass
 
 # Factory creator for WebRTCAudioRelay
 def create_webrtc_audio_relay_factory(queue_instance: asyncio.Queue):

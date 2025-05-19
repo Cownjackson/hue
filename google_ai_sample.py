@@ -94,18 +94,18 @@ class AudioLoop:
 
     async def _shutdown_monitor(self):
         await self._shutdown_event.wait()  
-        print("AudioLoop: _shutdown_monitor: Shutdown signaled.")
+        # print("AudioLoop: _shutdown_monitor: Shutdown signaled.") # Less verbose
 
         if self.audio_stream:  
-            print("AudioLoop: _shutdown_monitor: Attempting to stop microphone stream (self.audio_stream).")
+            # print("AudioLoop: _shutdown_monitor: Attempting to stop microphone stream (self.audio_stream).") # Less verbose
             try:
                 is_active = await asyncio.wait_for(asyncio.to_thread(self.audio_stream.is_active), timeout=1.0)
                 if is_active:
-                    print("AudioLoop: _shutdown_monitor: Microphone stream is active, calling stop_stream().")
+                    # print("AudioLoop: _shutdown_monitor: Microphone stream is active, calling stop_stream().") # Less verbose
                     await asyncio.wait_for(asyncio.to_thread(self.audio_stream.stop_stream), timeout=1.0)
-                    print("AudioLoop: _shutdown_monitor: Microphone stream stop_stream() called.")
-                else:
-                    print("AudioLoop: _shutdown_monitor: Microphone stream was already inactive.")
+                    # print("AudioLoop: _shutdown_monitor: Microphone stream stop_stream() called.") # Less verbose
+                # else:
+                    # print("AudioLoop: _shutdown_monitor: Microphone stream was already inactive.") # Less verbose
             except asyncio.TimeoutError:
                 print("AudioLoop: _shutdown_monitor: Timeout during microphone stream stop operation.")
             except Exception as e:
@@ -128,7 +128,7 @@ class AudioLoop:
                 except asyncio.TimeoutError:
                     continue 
 
-                print(f"AudioLoop: Got text from input queue: '{text}'")
+                # print(f"AudioLoop: Got text from input queue: '{text}'") # Keep this for user input confirmation
                 if text is None:  
                     print("AudioLoop: send_text_from_queue received None, signaling shutdown.")
                     self._shutdown_event.set()
@@ -140,12 +140,12 @@ class AudioLoop:
                 if self.session and not self._shutdown_event.is_set():
                     try:
                         await self.session.send_client_content(turns=user_content, turn_complete=True)
-                        print(f"AudioLoop: Sent to Gemini: '{text_to_send}'")
+                        print(f"AudioLoop: Sent to Gemini: '{text_to_send}'") # Keep this for user input confirmation
                     except Exception as e:
                         if not self._shutdown_event.is_set(): 
                             print(f"AudioLoop: Error sending client content: {e}")
                 elif self._shutdown_event.is_set():
-                    print("AudioLoop: Shutdown signaled in send_text, not sending.")
+                    # print("AudioLoop: Shutdown signaled in send_text, not sending.") # Less verbose
                     break
                 else:
                     if not self._shutdown_event.is_set(): print("AudioLoop: Session not active, cannot send text.")
@@ -153,7 +153,7 @@ class AudioLoop:
             print("AudioLoop: send_text_from_queue finished.")
 
     async def send_realtime(self):
-        print("AudioLoop: send_realtime started.")
+        # print("AudioLoop: send_realtime started.") # Less verbose
         try:
             while not self._shutdown_event.is_set():
                 if not self.out_queue: # out_queue will be populated by listen_audio from webrtc_audio_input_queue
@@ -162,26 +162,24 @@ class AudioLoop:
                 try:
                     msg = await asyncio.wait_for(self.out_queue.get(), timeout=0.5)
                     if msg is None: 
-                        print("AudioLoop: send_realtime received None from out_queue, exiting.")
+                        # print("AudioLoop: send_realtime received None from out_queue, exiting.") # Less verbose
                         break
                     
-                    # msg here is expected to be types.Part(inline_data=types.Blob(...))
                     if msg.inline_data and msg.inline_data.data:
-                        print(f"AudioLoop: send_realtime got part with {len(msg.inline_data.data)} bytes from out_queue.")
+                        # print(f"AudioLoop: send_realtime got part with {len(msg.inline_data.data)} bytes from out_queue.") # Too verbose
+                        pass
                     else:
-                        print("AudioLoop: send_realtime got part from out_queue, but inline_data or data is missing/empty.")
-                        continue # Skip if data is not as expected
+                        # print("AudioLoop: send_realtime got part from out_queue, but inline_data or data is missing/empty.") # Less verbose
+                        continue 
 
                     if self.session and not self._shutdown_event.is_set():
                         try:
-                            # print("AudioLoop: send_realtime attempting to send to Gemini...") # Optional: log before send
                             await self.session.send_realtime_input(media=msg.inline_data)
-                            # print("AudioLoop: send_realtime successfully sent to Gemini.") # Optional: log after send
                         except Exception as e:
                             if not self._shutdown_event.is_set():
                                 print(f"AudioLoop: Error in send_realtime while sending to session: {e}")
                     elif self._shutdown_event.is_set():
-                        print("AudioLoop: Shutdown signaled in send_realtime, not sending.")
+                        # print("AudioLoop: Shutdown signaled in send_realtime, not sending.") # Less verbose
                         break
                 except asyncio.TimeoutError:
                     continue 
@@ -190,7 +188,8 @@ class AudioLoop:
                         print(f"AudioLoop: Error in send_realtime: {e}")
                     await asyncio.sleep(0.1)
         finally:
-            print("AudioLoop: send_realtime finished.")
+            # print("AudioLoop: send_realtime finished.") # Less verbose
+            pass
 
     async def listen_audio(self):
         print("AudioLoop: listen_audio started (New Pause Detection Logic).")
@@ -204,7 +203,7 @@ class AudioLoop:
         last_audio_received_time = time.monotonic()
         
         MAX_UTTERANCE_DURATION_SECONDS = 2.5
-        SILENCE_THRESHOLD_SECONDS = 0.7
+        SILENCE_THRESHOLD_SECONDS = 0.4
         QUEUE_POLL_INTERVAL_SECONDS = 0.02 
         MIN_BUFFER_FOR_SILENCE_SEND_BYTES = int(0.3 * 16000 * 2) # Approx 0.3 seconds of audio
         
@@ -254,28 +253,23 @@ class AudioLoop:
                     current_time = time.monotonic()
                     if (current_time - last_audio_received_time) > SILENCE_THRESHOLD_SECONDS:
                         if len(internal_audio_buffer) >= MIN_BUFFER_FOR_SILENCE_SEND_BYTES:
-                            print(f"AudioLoop: listen_audio: Silence detected ({SILENCE_THRESHOLD_SECONDS}s) with SUFFICIENT audio ({len(internal_audio_buffer)} bytes vs min {MIN_BUFFER_FOR_SILENCE_SEND_BYTES} bytes). Triggering send.")
+                            # print(f"AudioLoop: listen_audio: Silence detected ({SILENCE_THRESHOLD_SECONDS}s) with SUFFICIENT audio ({len(internal_audio_buffer)} bytes vs min {MIN_BUFFER_FOR_SILENCE_SEND_BYTES} bytes). Triggering send.") # Too verbose
                             send_audio_now = True
                         else: 
-                            print(f"AudioLoop: listen_audio: Silence detected ({SILENCE_THRESHOLD_SECONDS}s) but audio buffer ({len(internal_audio_buffer)} bytes) is BELOW MINIMUM ({MIN_BUFFER_FOR_SILENCE_SEND_BYTES} bytes). Not sending yet.")
+                            # print(f"AudioLoop: listen_audio: Silence detected ({SILENCE_THRESHOLD_SECONDS}s) but audio buffer ({len(internal_audio_buffer)} bytes) is BELOW MINIMUM ({MIN_BUFFER_FOR_SILENCE_SEND_BYTES} bytes). Not sending yet.") # Too verbose
+                            pass
                 
                 if send_audio_now and internal_audio_buffer:
-                    print(f"AudioLoop: listen_audio: Preparing to send {len(internal_audio_buffer)} accumulated bytes.")
+                    # print(f"AudioLoop: listen_audio: Preparing to send {len(internal_audio_buffer)} accumulated bytes.") # Too verbose
                     part_to_send = types.Part(inline_data=types.Blob(data=bytes(internal_audio_buffer), mime_type="audio/pcm"))
                     
                     try:
                         await self.out_queue.put(part_to_send)
-                        print(f"AudioLoop: listen_audio: Sent {len(internal_audio_buffer)} bytes to out_queue.")
+                        # print(f"AudioLoop: listen_audio: Sent {len(internal_audio_buffer)} bytes to out_queue.") # Too verbose
                     except asyncio.QueueFull:
                          print(f"AudioLoop: listen_audio: out_queue is full. Discarding {len(internal_audio_buffer)} bytes.")
                     
                     internal_audio_buffer.clear()
-                    
-                    print(f"AudioLoop: listen_audio: Sending '.' text prompt to complete turn.")
-                    try:
-                        self.user_text_input_queue.put_nowait(".")
-                    except asyncio.QueueFull:
-                         print("AudioLoop: listen_audio: user_text_input_queue is full when trying to send '.' prompt.")
                     
                     last_audio_received_time = time.monotonic() 
                 
@@ -286,7 +280,7 @@ class AudioLoop:
             print("AudioLoop: listen_audio (New Pause Detection Logic) finished.")
 
     async def receive_audio(self):
-        print("AudioLoop: receive_audio started.")
+        # print("AudioLoop: receive_audio started.") # Less verbose
         try:
             while not self._shutdown_event.is_set():
                 if not self.session:
@@ -295,48 +289,48 @@ class AudioLoop:
                 try:
                     response_message_iterator = self.session.receive()
                     response_message = await asyncio.wait_for(response_message_iterator.__anext__(), timeout=0.5)
-                    print(f"AudioLoop: receive_audio got response_message: {type(response_message)}")
+                    # print(f"AudioLoop: receive_audio got response_message: {type(response_message)}") # Less verbose
                     
                     if server_tool_call := response_message.tool_call:
-                        print(f"AudioLoop: receive_audio processing tool_call: {server_tool_call}")
-                        if not self._shutdown_event.is_set():
-                             await handle_tool_call(self.session, server_tool_call)
+                        # print(f"AudioLoop: receive_audio processing tool_call: {server_tool_call}") # Keep, important event
+                        await handle_tool_call(self.session, server_tool_call)
                         continue
 
                     if server_content := response_message.server_content:
-                        print(f"AudioLoop: receive_audio processing server_content. Turn complete: {server_content.turn_complete}, Interrupted: {server_content.interrupted}")
+                        # print(f"AudioLoop: receive_audio processing server_content. Turn complete: {server_content.turn_complete}, Interrupted: {server_content.interrupted}") # Less verbose
                         if model_turn_content := server_content.model_turn:
-                            print(f"AudioLoop: receive_audio got model_turn_content with {len(model_turn_content.parts)} parts.")
+                            # print(f"AudioLoop: receive_audio got model_turn_content with {len(model_turn_content.parts)} parts.") # Less verbose
                             for i, part in enumerate(model_turn_content.parts):
                                 if self._shutdown_event.is_set(): break
                                 if part.text:
-                                    print(f"AudioLoop: receive_audio part {i} is text: '{part.text[:100]}...'") 
+                                    # print(f"AudioLoop: receive_audio part {i} is text: '{part.text[:100]}...'") # Less verbose
                                     if self.model_text_output_queue:
                                         self.model_text_output_queue.put_nowait(part.text)
                                     else: 
                                         if not self._shutdown_event.is_set(): print(part.text, end="", flush=True)
                                 elif part.inline_data and part.inline_data.data:
-                                    print(f"AudioLoop: receive_audio part {i} is inline_data (audio) with {len(part.inline_data.data)} bytes.")
+                                    # print(f"AudioLoop: receive_audio part {i} is inline_data (audio) with {len(part.inline_data.data)} bytes.") # Too verbose
                                     if self.audio_in_queue:
                                         self.audio_in_queue.put_nowait(part.inline_data.data)
                                 elif exec_result := part.code_execution_result:
                                     outcome_str = exec_result.outcome if exec_result.outcome else "UNSPECIFIED"
                                     output_str = exec_result.output if exec_result.output else ""
                                     msg = f"\n[Code Execution Result From Server]: Outcome: {outcome_str}, Output: \"{output_str}\""
-                                    print(f"AudioLoop: receive_audio part {i} is code_execution_result: {msg}")
+                                    # print(f"AudioLoop: receive_audio part {i} is code_execution_result: {msg}") # Keep, important event
                                     if self.model_text_output_queue:
                                         self.model_text_output_queue.put_nowait(msg)
                                     else:
                                         if not self._shutdown_event.is_set(): print(msg, flush=True)
                                 else:
-                                    print(f"AudioLoop: receive_audio part {i} is of an unknown type or empty. Part details: {part}") 
+                                    # print(f"AudioLoop: receive_audio part {i} is of an unknown type or empty. Part details: {part}") # Less verbose
+                                    pass 
                             if self.model_text_output_queue and server_content.turn_complete:
-                                print("AudioLoop: receive_audio model turn complete.")
+                                # print("AudioLoop: receive_audio model turn complete.") # Less verbose
                                 pass 
                         
                         if server_content.interrupted:
                             msg = "\n[Playback Interrupted by Server Signal]"
-                            print("AudioLoop: receive_audio server_content.interrupted is true.")
+                            print("AudioLoop: receive_audio server_content.interrupted is true.") # Keep, important event
                             if self.model_text_output_queue:
                                 self.model_text_output_queue.put_nowait(msg)
                             else:
@@ -358,10 +352,11 @@ class AudioLoop:
                         self._shutdown_event.set() 
                     break 
         finally:
-            print("AudioLoop: receive_audio finished.")
+            # print("AudioLoop: receive_audio finished.") # Less verbose
+            pass
 
     async def play_audio(self):
-        print("AudioLoop: play_audio started.")
+        # print("AudioLoop: play_audio started.") # Less verbose
         stream = None 
         try:
             stream = await asyncio.to_thread(
@@ -371,7 +366,7 @@ class AudioLoop:
                 rate=RECEIVE_SAMPLE_RATE,
                 output=True,
             )
-            print("AudioLoop: Audio output stream opened.")
+            # print("AudioLoop: Audio output stream opened.") # Less verbose
         except Exception as e:
             if not self._shutdown_event.is_set():
                 print(f"AudioLoop: Error opening audio output stream: {e}")
@@ -386,12 +381,12 @@ class AudioLoop:
                 try:
                     bytestream = await asyncio.wait_for(self.audio_in_queue.get(), timeout=0.5)
                     if bytestream is None: 
-                        print("AudioLoop: play_audio received None from audio_in_queue, exiting.")
+                        # print("AudioLoop: play_audio received None from audio_in_queue, exiting.") # Less verbose
                         break 
                     if not self._shutdown_event.is_set(): 
                         await asyncio.to_thread(stream.write, bytestream)
                     else:
-                        print("AudioLoop: Shutdown signaled in play_audio, not writing.")
+                        # print("AudioLoop: Shutdown signaled in play_audio, not writing.") # Less verbose
                         break
                 except asyncio.TimeoutError:
                     continue 
@@ -401,14 +396,15 @@ class AudioLoop:
                     await asyncio.sleep(0.1) 
         finally:
             if stream:
-                print("AudioLoop: play_audio finally: Closing audio output stream...")
+                # print("AudioLoop: play_audio finally: Closing audio output stream...") # Less verbose
                 try:
                     await asyncio.to_thread(stream.stop_stream)
                     await asyncio.to_thread(stream.close)
-                    print("AudioLoop: play_audio finally: Audio output stream closed.")
+                    # print("AudioLoop: play_audio finally: Audio output stream closed.") # Less verbose
                 except Exception as e:
                      print(f"AudioLoop: play_audio finally: Error closing output stream: {e}")
-            print("AudioLoop: play_audio finished.")
+            # print("AudioLoop: play_audio finished.") # Less verbose
+            pass
 
     async def run(self):
         print("AudioLoop: run method started.")
@@ -458,43 +454,43 @@ class AudioLoop:
             print("AudioLoop: run method entering finally block, ensuring shutdown signal is set...")
             self._shutdown_event.set() 
 
-            print("AudioLoop: Placing sentinels on all queues to unblock any waiting tasks...")
+            # print("AudioLoop: Placing sentinels on all queues to unblock any waiting tasks...") # Less verbose
             if self.user_text_input_queue: self.user_text_input_queue.put_nowait(None)
             if self.audio_in_queue: self.audio_in_queue.put_nowait(None)
             if self.out_queue: self.out_queue.put_nowait(None)
             if self.model_text_output_queue: self.model_text_output_queue.put_nowait(None) 
             
-            print("AudioLoop: Waiting briefly (e.g., 1s) for tasks to finalize based on event and sentinels...")
+            # print("AudioLoop: Waiting briefly (e.g., 1s) for tasks to finalize based on event and sentinels...") # Less verbose
             await asyncio.sleep(1.0) 
 
-            print("AudioLoop: Checking task states (for debugging, TaskGroup should handle joins/cancellations)...")
+            # print("AudioLoop: Checking task states (for debugging, TaskGroup should handle joins/cancellations)...") # Less verbose
             for task in self._tasks:
                 if not task.done():
-                    print(f"AudioLoop: Task {task.get_name()} is not done. Attempting cancellation.")
+                    # print(f"AudioLoop: Task {task.get_name()} is not done. Attempting cancellation.") # Less verbose
                     task.cancel() 
             if any(not task.done() for task in self._tasks):
                 await asyncio.sleep(0.5) 
                 for task in self._tasks:
                     if not task.done():
-                        print(f"AudioLoop: WARNING - Task {task.get_name()} still not done after cancellation attempt.")
+                        print(f"AudioLoop: WARNING - Task {task.get_name()} still not done after cancellation attempt.") # Keep, important warning
             
             if self.session:
-                print("AudioLoop: Gemini session should be closed by 'async with' context manager.")
+                # print("AudioLoop: Gemini session should be closed by 'async with' context manager.") # Less verbose
                 self.session = None 
             
-            print("AudioLoop: Terminating self.pya (PyAudio instance)...") # Changed print message
+            print("AudioLoop: Terminating self.pya (PyAudio instance)...")
             try:
-                if self.pya: # Check if self.pya exists
-                    await asyncio.to_thread(self.pya.terminate) # Ensure terminate is called in a thread for PyAudio
+                if self.pya: 
+                    await asyncio.to_thread(self.pya.terminate) 
                     print("AudioLoop: self.pya (PyAudio instance) terminated successfully.")
             except Exception as e:
                 print(f"AudioLoop: Error terminating self.pya (PyAudio instance): {e}")
-            self.pya = None # Clear the reference
+            self.pya = None 
             print("AudioLoop: run method finished cleanup.")
 
 
 async def handle_tool_call(session, server_tool_call: types.LiveServerToolCall):
-    print(f"Server tool call received: {server_tool_call}")
+    print(f"Server tool call received: {server_tool_call}") # Keep, important event
     
     function_responses = []
     
@@ -503,7 +499,7 @@ async def handle_tool_call(session, server_tool_call: types.LiveServerToolCall):
             tool_id = fc.id
             tool_name = fc.name
             
-            print(f"Executing tool: {tool_name} (ID: {tool_id})")
+            print(f"Executing tool: {tool_name} (ID: {tool_id})") # Keep, important event
             
             tool_result_dict = None 
             try:
@@ -528,10 +524,10 @@ async def handle_tool_call(session, server_tool_call: types.LiveServerToolCall):
                 ))
 
     if function_responses:
-        print(f"Sending tool responses to Gemini: {function_responses}")
+        print(f"Sending tool responses to Gemini: {function_responses}") # Keep, important event
         await session.send_tool_response(function_responses=function_responses)
     else:
-        print("No function calls were processed or found in the server_tool_call message.")
+        print("No function calls were processed or found in the server_tool_call message.") # Keep, useful info
 
 
 if __name__ == "__main__":
