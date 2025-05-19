@@ -7,6 +7,8 @@ from streamlit_webrtc import webrtc_streamer, AudioProcessorBase, WebRtcMode, RT
 import numpy as np
 import librosa
 import av # For av.AudioFrame
+from aiortc.mediastreams import AudioStreamTrack # Import AudioStreamTrack
+import time # For pts
 # import pyaudio # No longer needed here for normal operation
 
 # Ensure PyAudio is terminated when Streamlit shuts down (this is a bit tricky with Streamlit's execution model)
@@ -50,6 +52,7 @@ if 'audioloop_running' not in st.session_state:
     st.session_state.model_audio_output_queue = asyncio.Queue() # New queue for audio from Gemini to browser
     st.session_state.conversation_history = []
     st.session_state.stop_requested = False
+    st.session_state.generated_audio_track = None # To store the track instance
 
 TARGET_SAMPLE_RATE = 16000 # For Gemini
 # PYAUDIO_FORMAT = pyaudio.paInt16 # No longer needed
@@ -141,84 +144,106 @@ class WebRTCAudioRelay(AudioProcessorBase):
         # print("WebRTCAudioRelay __del__ called.") # Less verbose
         pass
 
-class AudioPlayerProcessor(AudioProcessorBase):
+class GeneratedAudioTrack(AudioStreamTrack):
+    kind = "audio"
+
     def __init__(self, model_audio_q: asyncio.Queue, target_sample_rate: int, target_channels: int):
-        self.model_audio_q = model_audio_q
+        super().__init__()  # Initialize base class
+        print(f"!!! GeneratedAudioTrack __init__ CALLED. Instance ID: {id(self)} !!!")
+        self.model_audio_q = model_audio_q # This will be used later for Gemini's audio
         self.target_sample_rate = target_sample_rate
         self.target_channels = target_channels
-        self.audio_buffer = bytearray() # Buffer for incomplete audio frames
-        # Each audio frame for playback should ideally represent a fixed duration, e.g., 20ms.
-        # For 24kHz, 16-bit mono, 20ms = 0.02s * 24000 samples/s * 1 channel * 2 bytes/sample = 960 bytes.
-        self.bytes_per_20ms_frame = int(0.02 * self.target_sample_rate * self.target_channels * 2)
-        self.phase = 0  # For tone generation
+        
+        # For tone generation (test)
+        self.samples_per_frame = int(0.02 * self.target_sample_rate) # 20ms worth of samples
+        self.phase = 0
         self.frequency = 440  # Hz (A4 note)
-        print(f"AudioPlayerProcessor initialized for TONE TEST. Target SR: {target_sample_rate}, Channels: {target_channels}, Bytes/Frame: {self.bytes_per_20ms_frame}")
+        self._start_time = time.time() # For pts calculation
+        self.last_pts = 0
+
+        print(f"GeneratedAudioTrack initialized for TONE TEST. Target SR: {self.target_sample_rate}, Channels: {self.target_channels}, Samples/Frame: {self.samples_per_frame}")
 
     async def recv(self):
-        # --- TONE GENERATION TEST --- 
-        # print("AudioPlayerProcessor: recv() TONE TEST")
-        samples_per_frame = self.bytes_per_20ms_frame // (self.target_channels * 2) # 2 bytes/sample (int16)
+        print(f"!!! GeneratedAudioTrack: recv() method ENTERED (TONE TEST) !!! Instance ID: {id(self)}")
         
-        t = (np.arange(samples_per_frame) + self.phase) / self.target_sample_rate
-        tone = (0.3 * np.sin(2 * np.pi * self.frequency * t) * 32767).astype(np.int16) # 0.3 amplitude
-        self.phase += samples_per_frame
+        # --- TONE GENERATION ---
+        # First, try to get actual model audio
+        try:
+            model_audio_bytes = self.model_audio_q.get_nowait()
+            # print(f"GeneratedAudioTrack: Got {len(model_audio_bytes)} bytes from model_audio_q.")
+            
+            # Ensure it's a multiple of frame size (samples_per_frame * channels * 2 bytes/sample)
+            # This part needs to be robust. For now, let's assume model_audio_bytes is correctly formatted.
+            # If not, we might need buffering here.
+            
+            num_expected_bytes_per_frame = self.samples_per_frame * self.target_channels * 2 # 2 bytes for int16
+            if len(model_audio_bytes) < num_expected_bytes_per_frame:
+                # print(f"GeneratedAudioTrack: Model audio chunk {len(model_audio_bytes)} bytes is smaller than frame size {num_expected_bytes_per_frame}. Padding with silence for now.")
+                # Simplistic padding - better to buffer and combine.
+                padding_bytes = b'\\x00' * (num_expected_bytes_per_frame - len(model_audio_bytes))
+                model_audio_bytes += padding_bytes
+            elif len(model_audio_bytes) > num_expected_bytes_per_frame:
+                # print(f"GeneratedAudioTrack: Model audio chunk {len(model_audio_bytes)} bytes is larger than frame size {num_expected_bytes_per_frame}. Truncating for now.")
+                model_audio_bytes = model_audio_bytes[:num_expected_bytes_per_frame]
 
-        if self.target_channels == 1:
-            audio_np_reshaped = tone.reshape(1, -1) # (1, num_samples)
-        else: # Crude stereo, just duplicate mono
-            audio_np_reshaped = np.vstack([tone, tone]).reshape(self.target_channels, -1, order='F')
 
-        # print(f"AudioPlayerProcessor (TONE TEST): Sending tone frame {audio_np_reshaped.shape[1]} samples.")
-        return av.AudioFrame.from_ndarray(audio_np_reshaped, format='s16', layout='mono' if self.target_channels == 1 else 'stereo', sample_rate=self.target_sample_rate)
-        # --- END TONE GENERATION TEST ---
+            audio_data_np = np.frombuffer(model_audio_bytes, dtype=np.int16)
+            # print(f"GeneratedAudioTrack: Converted model audio bytes to np array shape: {audio_data_np.shape}")
 
-        # Original queue logic (commented out for tone test):
-        # # print(\"AudioPlayerProcessor: recv() called\") 
-        # # Try to get some data from the queue to fill the buffer
-        # try:
-        #     # Consume available data from the queue without blocking indefinitely
-        #     # but wait a very short period if empty to catch data just arriving.
-        #     chunk = await asyncio.wait_for(self.model_audio_q.get(), timeout=0.015) # Increased timeout
-        #     if chunk is None: # Sentinel
-        #         return av.AudioFrame(format=\'s16\', layout=\'mono\', samples=0, sample_rate=self.target_sample_rate)
-        #     self.audio_buffer.extend(chunk)
-        #     self.model_audio_q.task_done()
-        #     while not self.model_audio_q.empty():
-        #         try:
-        #             chunk = self.model_audio_q.get_nowait()
-        #             if chunk is None: break 
-        #             self.audio_buffer.extend(chunk)
-        #             self.model_audio_q.task_done()
-        #         except asyncio.QueueEmpty:
-        #             break
-        # except asyncio.TimeoutError:
-        #     pass 
-        # except Exception as e:
-        #     print(f\"AudioPlayerProcessor: Error getting from model_audio_q: {e}\")
+            if self.target_channels == 1:
+                # Expected shape for from_ndarray (mono): (1, num_samples)
+                frame_data = audio_data_np.reshape(1, -1)
+                layout = 'mono'
+            elif self.target_channels == 2:
+                # Expected shape for from_ndarray (stereo): (num_samples, 2) for packed, or (2, num_samples) for planar
+                # Let's assume packed stereo: (samples_per_frame, 2)
+                # If Gemini gives interleaved stereo, it would be (samples_per_frame * 2,). Reshape to (samples_per_frame, 2)
+                frame_data = audio_data_np.reshape(-1, 2) # This assumes audio_data_np has samples_per_frame * 2 elements
+                layout = 'stereo'
+            else: # Fallback to mono
+                frame_data = audio_data_np.reshape(1, -1)
+                layout = 'mono'
+            
+            frame = av.AudioFrame.from_ndarray(frame_data, format='s16', layout=layout)
+            # print(f"GeneratedAudioTrack: Created frame from MODEL audio. Samples: {frame.samples}")
+            self.model_audio_q.task_done()
 
-        # if len(self.audio_buffer) >= self.bytes_per_20ms_frame:
-        #     frame_data_bytes = self.audio_buffer[:self.bytes_per_20ms_frame]
-        #     self.audio_buffer = self.audio_buffer[self.bytes_per_20ms_frame:]
-        #     audio_np = np.frombuffer(frame_data_bytes, dtype=np.int16)
-        #     if self.target_channels == 1:
-        #         audio_np_reshaped = audio_np.reshape(1, -1) 
-        #     else: 
-        #         audio_np_reshaped = audio_np.reshape(self.target_channels, -1, order=\'F\')
-        #     print(f\"AudioPlayerProcessor: Sending audio frame to browser ({audio_np_reshaped.shape[1]} samples per channel).\")
-        #     return av.AudioFrame.from_ndarray(audio_np_reshaped, format=\'s16\', layout=\'mono\' if self.target_channels == 1 else \'stereo\', sample_rate=self.target_sample_rate)
+        except asyncio.QueueEmpty:
+            # print("GeneratedAudioTrack: model_audio_q is empty. Generating TONE.") # Can be verbose
+            # --- FALLBACK TO TONE GENERATION if queue is empty ---
+            t = (np.arange(self.samples_per_frame) + self.phase) / self.target_sample_rate
+            tone_data = (0.3 * np.sin(2 * np.pi * self.frequency * t) * 32767).astype(np.int16)
+            self.phase += self.samples_per_frame
+
+            if self.target_channels == 1:
+                frame = av.AudioFrame.from_ndarray(tone_data.reshape(1, -1), format='s16', layout='mono')
+            elif self.target_channels == 2:
+                stereo_tone_data = np.vstack([tone_data, tone_data]).T
+                frame = av.AudioFrame.from_ndarray(stereo_tone_data, format='s16', layout='stereo')
+            else:
+                frame = av.AudioFrame.from_ndarray(tone_data.reshape(1, -1), format='s16', layout='mono')
+            # print(f"GeneratedAudioTrack: Created frame from TONE. Samples: {frame.samples}")
+
+
+        pts = time.time() - self._start_time
+        if pts <= self.last_pts:
+            pts = self.last_pts + 0.001 
+        self.last_pts = pts
+        frame.pts = pts 
+        frame.sample_rate = self.target_sample_rate
+
+        await asyncio.sleep(0.018) # Simulate real-time generation, slightly less than 20ms
+        return frame
+        # --- END TONE GENERATION ---
         
-        # silent_samples_per_channel = self.bytes_per_20ms_frame // (self.target_channels * 2)
-        # return av.AudioFrame(format=\'s16\', layout=\'mono\' if self.target_channels == 1 else \'stereo\', samples=silent_samples_per_channel, sample_rate=self.target_sample_rate)
+        # Placeholder for future: Get audio from self.model_audio_q
+        # For now, always generate tone. If queue is empty, could generate silence.
+
 
 # Factory creator for WebRTCAudioRelay
 def create_webrtc_audio_relay_factory(queue_instance: asyncio.Queue):
     def factory():
         return WebRTCAudioRelay(output_queue=queue_instance)
-    return factory
-
-def create_audio_player_factory(model_audio_q: asyncio.Queue):
-    def factory():
-        return AudioPlayerProcessor(model_audio_q=model_audio_q, target_sample_rate=RECEIVE_SAMPLE_RATE, target_channels=GEMINI_OUTPUT_CHANNELS)
     return factory
 
 def start_audioloop():
@@ -230,6 +255,15 @@ def start_audioloop():
         st.session_state.webrtc_audio_queue = asyncio.Queue() # Also re-initialize here for a clean start
         st.session_state.model_audio_output_queue = asyncio.Queue() # Ensure it's fresh
         st.session_state.conversation_history = [] # Clear history for new session
+
+        # Create the GeneratedAudioTrack instance here
+        st.session_state.generated_audio_track = GeneratedAudioTrack(
+            model_audio_q=st.session_state.model_audio_output_queue,
+            target_sample_rate=RECEIVE_SAMPLE_RATE, # Gemini's output rate
+            target_channels=GEMINI_OUTPUT_CHANNELS  # Gemini's output channels
+        )
+        print(f"Streamlit: Created GeneratedAudioTrack instance: {id(st.session_state.generated_audio_track)}")
+
 
         st.session_state.audioloop_instance = AudioLoop(
             user_text_input_queue=st.session_state.user_text_input_queue,
@@ -280,7 +314,7 @@ def stop_audioloop():
         st.session_state.audioloop_running = False
         st.session_state.audioloop_instance = None # Clear instance
         st.session_state.audioloop_thread = None   # Clear thread reference
-        # Queues are re-created in start_audioloop for a clean slate
+        st.session_state.generated_audio_track = None # Clear the track instance
         st.session_state.stop_requested = False # Reset here before rerun
         st.warning("AudioLoop service stopped.")
         print("Streamlit: AudioLoop service stop process completed in Streamlit UI.")
@@ -340,18 +374,22 @@ with col2:
         st.info("Start Voice Agent Service to enable audio output.")
         # Optional: could render a disabled player cosmetic here if desired
     else:
-        webrtc_player_ctx = webrtc_streamer(
-            key="audioloop-webrtc-speaker-enabled",
-            mode=WebRtcMode.RECVONLY,
-            audio_processor_factory=create_audio_player_factory(st.session_state.model_audio_output_queue),
-            rtc_configuration={"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]},
-            media_stream_constraints={"video": False, "audio": True}, # Audio is true, even for RECVONLY to enable playback path
-            desired_playing_state=st.session_state.audioloop_running 
-        )
-        if webrtc_player_ctx.state.playing:
-            st.success("Audio output is active.")
+        if st.session_state.generated_audio_track:
+            print(f"Streamlit: Passing GeneratedAudioTrack instance {id(st.session_state.generated_audio_track)} to webrtc_streamer for speaker.")
+            webrtc_player_ctx = webrtc_streamer(
+                key="audioloop-webrtc-speaker-enabled",
+                mode=WebRtcMode.RECVONLY,
+                source_audio_track=st.session_state.generated_audio_track, # USE THIS
+                rtc_configuration={"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]},
+                media_stream_constraints={"video": False, "audio": True}, 
+                desired_playing_state=st.session_state.audioloop_running 
+            )
+            if webrtc_player_ctx.state.playing:
+                st.success("Audio output is active.")
+            else:
+                st.warning("Audio output not active. Check browser or connection.")
         else:
-            st.warning("Audio output not active. Check browser or connection.")
+            st.error("GeneratedAudioTrack not initialized. Cannot start speaker.")
 
 with col1:
     st.subheader("Conversation")
