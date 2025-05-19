@@ -16,6 +16,7 @@ import asyncio
 import base64
 import io
 import traceback
+import time
 
 import pyaudio
 
@@ -78,16 +79,16 @@ CONFIG = types.LiveConnectConfig(
 )
 
 class AudioLoop:
-    def __init__(self, user_text_input_queue=None, model_text_output_queue=None):
+    def __init__(self, user_text_input_queue=None, model_text_output_queue=None, webrtc_audio_input_queue=None):
         self.user_text_input_queue = user_text_input_queue
         self.model_text_output_queue = model_text_output_queue
+        self.webrtc_audio_input_queue = webrtc_audio_input_queue
         
-        self.pya = pyaudio.PyAudio() # Instance-specific PyAudio
-        self.audio_in_queue = None 
-        self.out_queue = None      
+        self.pya = pyaudio.PyAudio() # Instance-specific PyAudio, now primarily for output
+        self.audio_in_queue = None  # For audio from Gemini to be played
+        self.out_queue = None       # For audio from mic (now WebRTC) to be sent to Gemini
 
         self.session = None
-        self.audio_stream = None 
         self._shutdown_event = asyncio.Event()
         self._tasks = [] 
 
@@ -111,6 +112,8 @@ class AudioLoop:
                 print(f"AudioLoop: _shutdown_monitor: Error stopping microphone stream: {e}")
         else:
             print("AudioLoop: _shutdown_monitor: No microphone stream (self.audio_stream was None) to stop.")
+            # No specific microphone stream to stop here if input is from WebRTC queue
+            pass 
 
     async def send_text_from_queue(self):
         print("AudioLoop: send_text_from_queue started.")
@@ -153,7 +156,7 @@ class AudioLoop:
         print("AudioLoop: send_realtime started.")
         try:
             while not self._shutdown_event.is_set():
-                if not self.out_queue:
+                if not self.out_queue: # out_queue will be populated by listen_audio from webrtc_audio_input_queue
                     await asyncio.sleep(0.1)
                     continue
                 try:
@@ -161,8 +164,22 @@ class AudioLoop:
                     if msg is None: 
                         print("AudioLoop: send_realtime received None from out_queue, exiting.")
                         break
+                    
+                    # msg here is expected to be types.Part(inline_data=types.Blob(...))
+                    if msg.inline_data and msg.inline_data.data:
+                        print(f"AudioLoop: send_realtime got part with {len(msg.inline_data.data)} bytes from out_queue.")
+                    else:
+                        print("AudioLoop: send_realtime got part from out_queue, but inline_data or data is missing/empty.")
+                        continue # Skip if data is not as expected
+
                     if self.session and not self._shutdown_event.is_set():
-                        await self.session.send_realtime_input(media=msg.inline_data)
+                        try:
+                            # print("AudioLoop: send_realtime attempting to send to Gemini...") # Optional: log before send
+                            await self.session.send_realtime_input(media=msg.inline_data)
+                            # print("AudioLoop: send_realtime successfully sent to Gemini.") # Optional: log after send
+                        except Exception as e:
+                            if not self._shutdown_event.is_set():
+                                print(f"AudioLoop: Error in send_realtime while sending to session: {e}")
                     elif self._shutdown_event.is_set():
                         print("AudioLoop: Shutdown signaled in send_realtime, not sending.")
                         break
@@ -176,73 +193,97 @@ class AudioLoop:
             print("AudioLoop: send_realtime finished.")
 
     async def listen_audio(self):
-        print("AudioLoop: listen_audio started.")
-        try:
-            mic_info = await asyncio.to_thread(self.pya.get_default_input_device_info)
-            self.audio_stream = await asyncio.to_thread(
-                self.pya.open,
-                format=FORMAT,
-                channels=CHANNELS,
-                rate=SEND_SAMPLE_RATE,
-                input=True,
-                input_device_index=mic_info["index"],
-                frames_per_buffer=CHUNK_SIZE,
-            )
-            print("AudioLoop: Microphone stream (self.audio_stream) opened.")
-        except Exception as e:
-            if not self._shutdown_event.is_set():
-                print(f"AudioLoop: Error opening microphone stream: {e}")
-                self._shutdown_event.set() 
-            self.audio_stream = None 
-            return 
+        print("AudioLoop: listen_audio started (New Pause Detection Logic).")
 
-        kwargs = {"exception_on_overflow": False} if __debug__ else {}
+        if not self.webrtc_audio_input_queue or not self.out_queue or not self.user_text_input_queue:
+            print("AudioLoop: listen_audio: Essential queue(s) not provided. Cannot listen.")
+            self._shutdown_event.set()
+            return
+
+        internal_audio_buffer = bytearray()
+        last_audio_received_time = time.monotonic()
         
+        MAX_UTTERANCE_DURATION_SECONDS = 2.5
+        SILENCE_THRESHOLD_SECONDS = 0.7
+        QUEUE_POLL_INTERVAL_SECONDS = 0.02 
+        MIN_BUFFER_FOR_SILENCE_SEND_BYTES = int(0.3 * 16000 * 2) # Approx 0.3 seconds of audio
+        
+        MAX_BUFFER_SIZE_BYTES = int(MAX_UTTERANCE_DURATION_SECONDS * 16000 * 2)
+
         try:
             while not self._shutdown_event.is_set():
-                if not self.out_queue or not self.audio_stream:
-                    await asyncio.sleep(0.1)
-                    if not self.audio_stream and not self._shutdown_event.is_set():
-                        print("AudioLoop: listen_audio: audio_stream is None, cannot read.")
-                        self._shutdown_event.set() 
-                    if self._shutdown_event.is_set(): break
-                    continue
+                send_audio_now = False
+                chunk_received_in_this_iteration = False
+
                 try:
-                    data = await asyncio.to_thread(self.audio_stream.read, CHUNK_SIZE, **kwargs)
-                    if self._shutdown_event.is_set(): 
-                        print("AudioLoop: Shutdown detected after audio_stream.read, breaking listen_audio loop.")
-                        break
-                    await self.out_queue.put(types.Part(inline_data=types.Blob(data=data, mime_type="audio/pcm")))
-                except IOError as e: 
-                    if self._shutdown_event.is_set():
-                        print(f"AudioLoop: Expected IOError in listen_audio during shutdown (stream likely closed by monitor): {e}")
-                    elif e.errno == pyaudio.paInputOverflowed:
-                        if not self._shutdown_event.is_set(): print("AudioLoop: Microphone input overflowed.")
-                    else:
-                        if not self._shutdown_event.is_set(): 
-                            print(f"AudioLoop: IOError in listen_audio: {e}")
-                            self._shutdown_event.set() 
-                    break 
+                    audio_chunk_bytes = await asyncio.wait_for(
+                        self.webrtc_audio_input_queue.get(), 
+                        timeout=QUEUE_POLL_INTERVAL_SECONDS 
+                    )
+                    
+                    if audio_chunk_bytes is None: 
+                        print("AudioLoop: listen_audio received None (shutdown) from webrtc_audio_input_queue.")
+                        self._shutdown_event.set()
+                        if internal_audio_buffer: 
+                            send_audio_now = True
+                        else:
+                            break 
+
+                    if not self._shutdown_event.is_set() and audio_chunk_bytes:
+                        internal_audio_buffer.extend(audio_chunk_bytes)
+                        last_audio_received_time = time.monotonic()
+                        chunk_received_in_this_iteration = True
+
+                        if len(internal_audio_buffer) >= MAX_BUFFER_SIZE_BYTES:
+                            print(f"AudioLoop: listen_audio: Max buffer size ({MAX_BUFFER_SIZE_BYTES} bytes) reached.")
+                            send_audio_now = True
+                
+                except asyncio.TimeoutError:
+                    pass 
+                
                 except Exception as e:
                     if not self._shutdown_event.is_set():
-                        print(f"AudioLoop: Unexpected error in listen_audio: {e}")
-                        self._shutdown_event.set() 
+                        print(f"AudioLoop: Unexpected error getting from webrtc_audio_input_queue: {e}")
+                        self._shutdown_event.set()
                     break 
+
+                if self._shutdown_event.is_set() and not internal_audio_buffer:
+                     break
+
+                if not chunk_received_in_this_iteration and internal_audio_buffer:
+                    current_time = time.monotonic()
+                    if (current_time - last_audio_received_time) > SILENCE_THRESHOLD_SECONDS:
+                        if len(internal_audio_buffer) >= MIN_BUFFER_FOR_SILENCE_SEND_BYTES:
+                            print(f"AudioLoop: listen_audio: Silence detected ({SILENCE_THRESHOLD_SECONDS}s) with sufficient audio ({len(internal_audio_buffer)} bytes). Triggering send.")
+                            send_audio_now = True
+                        # else: # Optional: log if silence detected but buffer too small
+                            # print(f"AudioLoop: listen_audio: Silence detected but buffer ({len(internal_audio_buffer)} bytes) is below minimum ({MIN_BUFFER_FOR_SILENCE_SEND_BYTES} bytes). Not sending yet.")
+                
+                if send_audio_now and internal_audio_buffer:
+                    print(f"AudioLoop: listen_audio: Preparing to send {len(internal_audio_buffer)} accumulated bytes.")
+                    part_to_send = types.Part(inline_data=types.Blob(data=bytes(internal_audio_buffer), mime_type="audio/pcm"))
+                    
+                    try:
+                        await self.out_queue.put(part_to_send)
+                        print(f"AudioLoop: listen_audio: Sent {len(internal_audio_buffer)} bytes to out_queue.")
+                    except asyncio.QueueFull:
+                         print(f"AudioLoop: listen_audio: out_queue is full. Discarding {len(internal_audio_buffer)} bytes.")
+                    
+                    internal_audio_buffer.clear()
+                    
+                    print(f"AudioLoop: listen_audio: Sending '.' text prompt to complete turn.")
+                    try:
+                        self.user_text_input_queue.put_nowait(".")
+                    except asyncio.QueueFull:
+                         print("AudioLoop: listen_audio: user_text_input_queue is full when trying to send '.' prompt.")
+                    
+                    last_audio_received_time = time.monotonic() 
+                
+                if self._shutdown_event.is_set() and not internal_audio_buffer:
+                    break
+
         finally:
-            if self.audio_stream:
-                print("AudioLoop: listen_audio finally: Closing microphone stream (self.audio_stream)...")
-                try:
-                    is_stopped = await asyncio.to_thread(self.audio_stream.is_stopped)
-                    if not is_stopped:
-                        await asyncio.to_thread(self.audio_stream.stop_stream)
-                    await asyncio.to_thread(self.audio_stream.close)
-                    print("AudioLoop: listen_audio finally: Microphone stream (self.audio_stream) closed.")
-                except Exception as e:
-                    print(f"AudioLoop: listen_audio finally: Error closing mic stream (self.audio_stream): {e}")
-                self.audio_stream = None 
-            else:
-                print("AudioLoop: listen_audio finally: self.audio_stream was already None.")
-            print("AudioLoop: listen_audio finished.")
+            print("AudioLoop: listen_audio (New Pause Detection Logic) finished.")
 
     async def receive_audio(self):
         print("AudioLoop: receive_audio started.")
@@ -254,37 +295,48 @@ class AudioLoop:
                 try:
                     response_message_iterator = self.session.receive()
                     response_message = await asyncio.wait_for(response_message_iterator.__anext__(), timeout=0.5)
+                    print(f"AudioLoop: receive_audio got response_message: {type(response_message)}")
                     
                     if server_tool_call := response_message.tool_call:
+                        print(f"AudioLoop: receive_audio processing tool_call: {server_tool_call}")
                         if not self._shutdown_event.is_set():
                              await handle_tool_call(self.session, server_tool_call)
                         continue
 
                     if server_content := response_message.server_content:
+                        print(f"AudioLoop: receive_audio processing server_content. Turn complete: {server_content.turn_complete}, Interrupted: {server_content.interrupted}")
                         if model_turn_content := server_content.model_turn:
-                            for part in model_turn_content.parts:
+                            print(f"AudioLoop: receive_audio got model_turn_content with {len(model_turn_content.parts)} parts.")
+                            for i, part in enumerate(model_turn_content.parts):
                                 if self._shutdown_event.is_set(): break
                                 if part.text:
+                                    print(f"AudioLoop: receive_audio part {i} is text: '{part.text[:100]}...'") 
                                     if self.model_text_output_queue:
                                         self.model_text_output_queue.put_nowait(part.text)
                                     else: 
                                         if not self._shutdown_event.is_set(): print(part.text, end="", flush=True)
                                 elif part.inline_data and part.inline_data.data:
+                                    print(f"AudioLoop: receive_audio part {i} is inline_data (audio) with {len(part.inline_data.data)} bytes.")
                                     if self.audio_in_queue:
                                         self.audio_in_queue.put_nowait(part.inline_data.data)
                                 elif exec_result := part.code_execution_result:
                                     outcome_str = exec_result.outcome if exec_result.outcome else "UNSPECIFIED"
                                     output_str = exec_result.output if exec_result.output else ""
                                     msg = f"\n[Code Execution Result From Server]: Outcome: {outcome_str}, Output: \"{output_str}\""
+                                    print(f"AudioLoop: receive_audio part {i} is code_execution_result: {msg}")
                                     if self.model_text_output_queue:
                                         self.model_text_output_queue.put_nowait(msg)
                                     else:
                                         if not self._shutdown_event.is_set(): print(msg, flush=True)
+                                else:
+                                    print(f"AudioLoop: receive_audio part {i} is of an unknown type or empty. Part details: {part}") 
                             if self.model_text_output_queue and server_content.turn_complete:
+                                print("AudioLoop: receive_audio model turn complete.")
                                 pass 
                         
                         if server_content.interrupted:
                             msg = "\n[Playback Interrupted by Server Signal]"
+                            print("AudioLoop: receive_audio server_content.interrupted is true.")
                             if self.model_text_output_queue:
                                 self.model_text_output_queue.put_nowait(msg)
                             else:
@@ -371,8 +423,14 @@ class AudioLoop:
 
                 if self.user_text_input_queue is None: self.user_text_input_queue = asyncio.Queue()
                 if self.model_text_output_queue is None: self.model_text_output_queue = asyncio.Queue()
-                self.audio_in_queue = asyncio.Queue()
-                self.out_queue = asyncio.Queue(maxsize=50) 
+                if self.webrtc_audio_input_queue is None:
+                     print("AudioLoop: CRITICAL - webrtc_audio_input_queue not set up during run!")
+                     # This should not happen if initialized correctly from webapp_streamlit.py
+                     self._shutdown_event.set() # Force shutdown if this essential queue is missing
+                     raise ValueError("webrtc_audio_input_queue not provided to AudioLoop")
+
+                self.audio_in_queue = asyncio.Queue() # For Gemini audio output
+                self.out_queue = asyncio.Queue(maxsize=50)  # For processed WebRTC audio to Gemini
 
                 async with asyncio.TaskGroup() as tg:
                     print("AudioLoop: Creating tasks within TaskGroup...")
@@ -427,7 +485,7 @@ class AudioLoop:
             print("AudioLoop: Terminating self.pya (PyAudio instance)...") # Changed print message
             try:
                 if self.pya: # Check if self.pya exists
-                    self.pya.terminate()
+                    await asyncio.to_thread(self.pya.terminate) # Ensure terminate is called in a thread for PyAudio
                     print("AudioLoop: self.pya (PyAudio instance) terminated successfully.")
             except Exception as e:
                 print(f"AudioLoop: Error terminating self.pya (PyAudio instance): {e}")
@@ -480,9 +538,10 @@ if __name__ == "__main__":
     print("Starting AudioLoop directly for testing...")
     user_q = asyncio.Queue()
     model_q = asyncio.Queue()
+    webrtc_q = asyncio.Queue() # Dummy queue for direct testing, WebRTCAudioRelay would normally populate this
     loop_task = None 
     
-    main_loop = AudioLoop(user_text_input_queue=user_q, model_text_output_queue=model_q)
+    main_loop = AudioLoop(user_text_input_queue=user_q, model_text_output_queue=model_q, webrtc_audio_input_queue=webrtc_q)
     
     async def console_input_sender(queue):
         while True:
@@ -519,7 +578,7 @@ if __name__ == "__main__":
         print("Console input finished. Main loop should be shutting down.")
         
         try:
-            await asyncio.wait_for(loop_task, timeout=10.0) 
+            await asyncio.wait_for(loop_task, timeout=15.0) # Increased timeout to allow for processing simulated audio
             print("Main loop task completed.")
         except asyncio.TimeoutError:
             print("Main loop task timed out during shutdown. Attempting cancellation.")

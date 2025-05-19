@@ -3,12 +3,16 @@ import asyncio
 import threading
 from queue import Queue as ThreadQueue
 from google_ai_sample import AudioLoop # Assuming types and other necessary components are accessible or re-imported if needed
+from streamlit_webrtc import webrtc_streamer, AudioProcessorBase, WebRtcMode
+import numpy as np
+import librosa
+import av # For av.AudioFrame
 
 # Ensure PyAudio is terminated when Streamlit shuts down (this is a bit tricky with Streamlit's execution model)
 # A cleaner way would be to manage the PyAudio instance within AudioLoop and ensure its cleanup.
 # For now, we rely on AudioLoop's cleanup.
 
-def run_audioloop_in_thread(audioloop_instance, streamlit_user_q, streamlit_model_q):
+def run_audioloop_in_thread(audioloop_instance, streamlit_user_q, streamlit_model_q, webrtc_audio_q):
     """Target function for the AudioLoop thread."""
     # Create a new event loop for this thread
     loop = asyncio.new_event_loop()
@@ -17,6 +21,7 @@ def run_audioloop_in_thread(audioloop_instance, streamlit_user_q, streamlit_mode
     # Assign the Streamlit-managed asyncio.Queues to the audioloop_instance
     audioloop_instance.user_text_input_queue = streamlit_user_q
     audioloop_instance.model_text_output_queue = streamlit_model_q
+    audioloop_instance.webrtc_audio_input_queue = webrtc_audio_q # Assign the WebRTC audio queue
     
     print("Starting AudioLoop.run() in a new thread...")
     try:
@@ -30,30 +35,126 @@ def run_audioloop_in_thread(audioloop_instance, streamlit_user_q, streamlit_mode
         loop.close()
 
 st.set_page_config(layout="wide")
-st.title("Gemini Live Voice Agent - Text Interface")
+st.title("Gemini Live Voice Agent - Text & Voice Interface")
 
-# Initialize session state variables
+# Initialize session state variables ONCE
 if 'audioloop_running' not in st.session_state:
     st.session_state.audioloop_running = False
     st.session_state.audioloop_instance = None
     st.session_state.audioloop_thread = None
-    # Use asyncio.Queue for interaction with the asyncio-based AudioLoop
     st.session_state.user_text_input_queue = asyncio.Queue()
     st.session_state.model_text_output_queue = asyncio.Queue()
+    st.session_state.webrtc_audio_queue = asyncio.Queue() # Initialize WebRTC audio queue here
     st.session_state.conversation_history = []
     st.session_state.stop_requested = False
 
+TARGET_SAMPLE_RATE = 16000 # For Gemini
+
+class WebRTCAudioRelay(AudioProcessorBase):
+    def __init__(self, output_queue: asyncio.Queue):
+        self.output_queue = output_queue
+        self.last_sample_rate = None
+        self.last_channels = None
+        print(f"WebRTCAudioRelay __init__ called. Output queue type: {type(self.output_queue)}")
+
+    async def recv_queued(self, frames: list[av.AudioFrame], bundled_frames: list[av.AudioFrame] | None = None):
+        # This method is called by streamlit-webrtc with a list of AudioFrames
+        # Accumulate all processed audio from this batch of frames into one bytearray
+        all_processed_bytes_for_this_callback = bytearray()
+
+        if not frames:
+            return
+
+        print(f"WebRTCAudioRelay: recv_queued called with {len(frames)} frames.") # Log number of frames received
+
+        for frame_idx, frame in enumerate(frames):
+            # print(f"WebRTCAudioRelay: Processing frame {frame_idx+1}/{len(frames)} | SR: {frame.sample_rate}, CH: {frame.layout.nb_channels}, Samples: {frame.samples}")
+            if self.last_sample_rate != frame.sample_rate or self.last_channels != frame.layout.nb_channels:
+                print(f"WebRTCAudioRelay: Audio properties changed: SR={frame.sample_rate}, Channels={frame.layout.nb_channels}")
+                self.last_sample_rate = frame.sample_rate
+                self.last_channels = frame.layout.nb_channels
+
+            raw_audio_nd = frame.to_ndarray() 
+            float_audio_nd = raw_audio_nd.astype(np.float32) / 32768.0
+            
+            mono_audio = None
+            if frame.layout.nb_channels > 1:
+                if float_audio_nd.ndim == 2 and float_audio_nd.shape[0] == 1: 
+                    interleaved_samples = float_audio_nd[0]
+                    try:
+                        reshaped_for_librosa = interleaved_samples.reshape((-1, frame.layout.nb_channels)).T
+                        mono_audio = librosa.to_mono(reshaped_for_librosa)
+                    except Exception as e:
+                        # print(f"WebRTCAudioRelay: Error during stereo to mono conversion (reshape/to_mono): {e}. Shape: {interleaved_samples.shape}, Channels: {frame.layout.nb_channels}")
+                        mono_audio = np.array([], dtype=np.float32) # Empty array on error
+                elif float_audio_nd.ndim == 2 and float_audio_nd.shape[0] == frame.layout.nb_channels: 
+                    try:
+                        mono_audio = librosa.to_mono(float_audio_nd)
+                    except Exception as e:
+                        # print(f"WebRTCAudioRelay: Error during stereo to mono conversion (to_mono direct): {e}. Shape: {float_audio_nd.shape}")
+                        mono_audio = np.array([], dtype=np.float32)
+                else:
+                    # print(f"WebRTCAudioRelay: Unexpected audio array shape for stereo: {float_audio_nd.shape}, channels: {frame.layout.nb_channels}. Skipping frame processing.")
+                    mono_audio = np.array([], dtype=np.float32)
+            elif frame.layout.nb_channels == 1:
+                if float_audio_nd.ndim == 2 and float_audio_nd.shape[0] == 1: 
+                    mono_audio = float_audio_nd[0]
+                elif float_audio_nd.ndim == 1: 
+                     mono_audio = float_audio_nd
+                else:
+                    # print(f"WebRTCAudioRelay: Unexpected mono audio array shape: {float_audio_nd.shape}. Skipping frame processing.")
+                    mono_audio = np.array([], dtype=np.float32)
+            else:
+                # print(f"WebRTCAudioRelay: Unknown channel layout: {frame.layout.nb_channels}. Skipping frame processing.")
+                mono_audio = np.array([], dtype=np.float32)
+
+            if mono_audio.size == 0: # If mono_audio is empty (e.g. due to error or unexpected format)
+                # print(f"WebRTCAudioRelay: Mono audio is empty for frame {frame_idx+1}. Skipping resampling and conversion for this frame.")
+                continue # Skip to the next frame
+
+            if frame.sample_rate != TARGET_SAMPLE_RATE:
+                try:
+                    resampled_audio = librosa.resample(mono_audio, orig_sr=frame.sample_rate, target_sr=TARGET_SAMPLE_RATE)
+                except Exception as e:
+                    # print(f"WebRTCAudioRelay: Error during resampling: {e}. Mono audio size: {mono_audio.size}, SR: {frame.sample_rate}")
+                    continue # Skip this frame on resampling error
+            else:
+                resampled_audio = mono_audio
+            
+            int16_audio = (np.clip(resampled_audio, -1.0, 1.0) * 32767).astype(np.int16)
+            all_processed_bytes_for_this_callback.extend(int16_audio.tobytes())
+        
+        # After processing all frames in this batch, put the consolidated audio onto the queue
+        if all_processed_bytes_for_this_callback:
+            try:
+                self.output_queue.put_nowait(bytes(all_processed_bytes_for_this_callback)) 
+                print(f"WebRTCAudioRelay: Queued one consolidated block of {len(all_processed_bytes_for_this_callback)} bytes. Output queue size: {self.output_queue.qsize()}") # Log size of queued block
+            except asyncio.QueueFull:
+                print("WebRTCAudioRelay: Output queue is full. Discarding consolidated audio block.")
+            except Exception as e:
+                print(f"WebRTCAudioRelay: Error putting consolidated audio to queue: {e}")
+        # else:
+            # print("WebRTCAudioRelay: No audio bytes processed in this callback, not queuing anything.")
+
+# Factory creator for WebRTCAudioRelay
+def create_webrtc_audio_relay_factory(queue_instance: asyncio.Queue):
+    def factory():
+        return WebRTCAudioRelay(output_queue=queue_instance)
+    return factory
 
 def start_audioloop():
     if not st.session_state.audioloop_running:
         # Re-initialize queues for a fresh start if they were used by a previous run
+        # Ensure all queues are new for the new session
         st.session_state.user_text_input_queue = asyncio.Queue()
         st.session_state.model_text_output_queue = asyncio.Queue()
+        st.session_state.webrtc_audio_queue = asyncio.Queue() # Also re-initialize here for a clean start
         st.session_state.conversation_history = [] # Clear history for new session
 
         st.session_state.audioloop_instance = AudioLoop(
             user_text_input_queue=st.session_state.user_text_input_queue,
-            model_text_output_queue=st.session_state.model_text_output_queue
+            model_text_output_queue=st.session_state.model_text_output_queue,
+            webrtc_audio_input_queue=st.session_state.webrtc_audio_queue 
         )
         
         st.session_state.audioloop_thread = threading.Thread(
@@ -61,9 +162,10 @@ def start_audioloop():
             args=(
                 st.session_state.audioloop_instance,
                 st.session_state.user_text_input_queue,
-                st.session_state.model_text_output_queue
+                st.session_state.model_text_output_queue,
+                st.session_state.webrtc_audio_queue # Pass the queue to the thread function
             ),
-            daemon=True # Daemon allows Streamlit to exit even if thread is stuck, but we try to join.
+            daemon=True 
         )
         st.session_state.audioloop_thread.start()
         st.session_state.audioloop_running = True
@@ -120,7 +222,36 @@ with col2:
         # While stopping, show a disabled-like state or a message
         st.button("Processing Stop...", disabled=True)
     
-    st.caption("Audio I/O uses server's default devices.")
+    st.caption("Audio I/O uses server's default devices for output, browser microphone for input.")
+
+    # Add WebRTC streamer
+    st.subheader("Microphone Input (Browser)")
+    if not st.session_state.audioloop_running:
+        st.info("Start Voice Agent Service to enable microphone input.")
+        # Disable WebRTC if audioloop is not running to prevent sending to a non-existent queue consumer
+        webrtc_ctx = webrtc_streamer(
+            key="audioloop-webrtc-input-disabled",
+            mode=WebRtcMode.SENDONLY,
+            audio_processor_factory=None, 
+            rtc_configuration={"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]},
+            media_stream_constraints={"video": False, "audio": True},
+            sendback_audio=False, 
+            desired_playing_state=False
+        )
+    else:
+         webrtc_ctx = webrtc_streamer(
+            key="audioloop-webrtc-input-enabled",
+            mode=WebRtcMode.SENDONLY,
+            audio_processor_factory=create_webrtc_audio_relay_factory(st.session_state.webrtc_audio_queue),
+            rtc_configuration={"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]},
+            media_stream_constraints={"video": False, "audio": True},
+            sendback_audio=False,
+            desired_playing_state=st.session_state.audioloop_running
+        )
+         if webrtc_ctx.state.playing:
+            st.success("Microphone is active via browser.")
+         else:
+            st.warning("Microphone is not currently active or sending data. Click 'START' above if available.")
 
 with col1:
     st.subheader("Conversation")
