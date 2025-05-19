@@ -18,55 +18,65 @@ import io
 import traceback
 import time
 
-import pyaudio
+# import pyaudio # PyAudio removed as playback moves to client
+# from google.generativeai import types # Corrected import path if needed, standard is google.genai
+from google.genai import types # Standard import
 
 import argparse
 
 from google import genai
-from google.genai import types
 from dotenv import load_dotenv
 
 # Import the new tools
-from tools import turn_office_light_on, turn_office_light_off
+from tools import turn_office_light_on, turn_office_light_off, control_light
 
 load_dotenv()
 
-FORMAT = pyaudio.paInt16
-CHANNELS = 1
+# FORMAT = pyaudio.paInt16 # Removed, PyAudio not used here
+CHANNELS = 1 # For mic config, and can inform client about Gemini output format
 SEND_SAMPLE_RATE = 16000
-RECEIVE_SAMPLE_RATE = 24000
-CHUNK_SIZE = 1024
+RECEIVE_SAMPLE_RATE = 24000 # Gemini's output audio sample rate
 
-MODEL = "models/gemini-2.0-flash-live-001"
+MODEL = "models/gemini-2.0-flash-live-001" # Ensured correct model
 
-client = genai.Client(
+client = genai.Client( # Ensured original client init
     http_options={"api_version": "v1beta"},
     api_key=os.environ.get("GEMINI_API_KEY"),
 )
 
 # Define the new tools for the voice agent
-tools = [
+tools_list = [
     types.Tool(
         function_declarations=[
             types.FunctionDeclaration(
-                name="turn_office_light_on",
-                description="Turns the office lamp on.",
-                parameters=genai.types.Schema(type=genai.types.Type.OBJECT, properties={}),
+                name="control_light",
+                description="Controls a specific light by its name. Can turn it ON, OFF, or TOGGLE its state. Can optionally set brightness if turning ON or toggling to ON.",
+                parameters=types.Schema(
+                    type=types.Type.OBJECT, 
+                    properties={
+                        "light_name": types.Schema(type=types.Type.STRING, description="The user-friendly name of the light (e.g., 'Office Lamp', 'Living Boob 1')." ),
+                        "action": types.Schema(type=types.Type.STRING, description="The desired action: 'ON', 'OFF', or 'TOGGLE'."),
+                        "brightness_percent": types.Schema(type=types.Type.NUMBER, description="Optional: The desired brightness level (0-100). Applied if action results in the light being ON.", nullable=True),
+                    },
+                    required=["light_name", "action"]
+                )
             ),
-        ]
-    ),
-    types.Tool(
-        function_declarations=[
-            types.FunctionDeclaration(
-                name="turn_office_light_off",
-                description="Turns the office lamp off.",
-                parameters=genai.types.Schema(type=genai.types.Type.OBJECT, properties={}),
-            ),
+            # Retain old tools for now, can be removed if control_light covers all uses or if they are adapted
+            # types.FunctionDeclaration(
+            #     name="turn_office_light_on",
+            #     description="Turns the office lamp on.",
+            #     parameters=types.Schema(type=types.Type.OBJECT, properties={}),
+            # ),
+            # types.FunctionDeclaration(
+            #     name="turn_office_light_off",
+            #     description="Turns the office lamp off.",
+            #     parameters=types.Schema(type=types.Type.OBJECT, properties={}),
+            # ),
         ]
     )
 ]
 
-CONFIG = types.LiveConnectConfig(
+CONFIG = types.LiveConnectConfig( # Ensured original config structure
     response_modalities=[
         "AUDIO",
     ],
@@ -75,22 +85,25 @@ CONFIG = types.LiveConnectConfig(
             prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name="Charon")
         )
     ),
-    tools=tools,
+    tools=tools_list, # Use renamed list
 )
 
 class AudioLoop:
-    def __init__(self, user_text_input_queue=None, model_text_output_queue=None, webrtc_audio_input_queue=None):
+    def __init__(self, user_text_input_queue=None, model_text_output_queue=None, webrtc_audio_input_queue=None, model_audio_output_queue=None): # Added model_audio_output_queue
         self.user_text_input_queue = user_text_input_queue
         self.model_text_output_queue = model_text_output_queue
         self.webrtc_audio_input_queue = webrtc_audio_input_queue
+        self.model_audio_output_queue = model_audio_output_queue # Store new queue
         
-        self.pya = pyaudio.PyAudio() # Instance-specific PyAudio, now primarily for output
-        self.audio_in_queue = None  # For audio from Gemini to be played
-        self.out_queue = None       # For audio from mic (now WebRTC) to be sent to Gemini
+        self.pya = None # PyAudio instance removed from direct init
+        # self.audio_in_queue = None  # Replaced by model_audio_output_queue
+        self.out_queue = None       # For audio from mic (WebRTC) to be sent to Gemini
 
         self.session = None
         self._shutdown_event = asyncio.Event()
-        self._tasks = [] 
+        self._tasks = []
+    
+    # _initialize_pyaudio_if_needed method removed
 
     async def _shutdown_monitor(self):
         await self._shutdown_event.wait()  
@@ -309,9 +322,11 @@ class AudioLoop:
                                     else: 
                                         if not self._shutdown_event.is_set(): print(part.text, end="", flush=True)
                                 elif part.inline_data and part.inline_data.data:
-                                    # print(f"AudioLoop: receive_audio part {i} is inline_data (audio) with {len(part.inline_data.data)} bytes.") # Too verbose
-                                    if self.audio_in_queue:
-                                        self.audio_in_queue.put_nowait(part.inline_data.data)
+                                    print(f"AudioLoop: receive_audio: Got audio data from Gemini ({len(part.inline_data.data)} bytes), queuing for browser.") # Key log added
+                                    if self.model_audio_output_queue: # MODIFIED: Use new queue
+                                        self.model_audio_output_queue.put_nowait(part.inline_data.data)
+                                    else:
+                                        print("AudioLoop: model_audio_output_queue not available to send audio data.")
                                 elif exec_result := part.code_execution_result:
                                     outcome_str = exec_result.outcome if exec_result.outcome else "UNSPECIFIED"
                                     output_str = exec_result.output if exec_result.output else ""
@@ -335,9 +350,9 @@ class AudioLoop:
                                 self.model_text_output_queue.put_nowait(msg)
                             else:
                                 if not self._shutdown_event.is_set(): print(msg, flush=True)
-                            if self.audio_in_queue:
-                                while not self.audio_in_queue.empty():
-                                    try: self.audio_in_queue.get_nowait()
+                            if self.model_audio_output_queue: # MODIFIED: Clear new queue
+                                while not self.model_audio_output_queue.empty():
+                                    try: self.model_audio_output_queue.get_nowait()
                                     except asyncio.QueueEmpty: break
                 except asyncio.TimeoutError:
                     continue 
@@ -356,54 +371,24 @@ class AudioLoop:
             pass
 
     async def play_audio(self):
-        # print("AudioLoop: play_audio started.") # Less verbose
-        stream = None 
-        try:
-            stream = await asyncio.to_thread(
-                self.pya.open, # Use self.pya
-                format=FORMAT,
-                channels=CHANNELS,
-                rate=RECEIVE_SAMPLE_RATE,
-                output=True,
-            )
-            # print("AudioLoop: Audio output stream opened.") # Less verbose
-        except Exception as e:
-            if not self._shutdown_event.is_set():
-                print(f"AudioLoop: Error opening audio output stream: {e}")
-                self._shutdown_event.set() 
-            return 
-
+        # print("AudioLoop: play_audio started (now a no-op for server-side PyAudio).")
+        # This method no longer plays audio directly using PyAudio.
+        # Audio is routed to model_audio_output_queue for client-side handling.
         try:
             while not self._shutdown_event.is_set():
-                if not self.audio_in_queue:
-                    await asyncio.sleep(0.1)
-                    continue
-                try:
-                    bytestream = await asyncio.wait_for(self.audio_in_queue.get(), timeout=0.5)
-                    if bytestream is None: 
-                        # print("AudioLoop: play_audio received None from audio_in_queue, exiting.") # Less verbose
-                        break 
-                    if not self._shutdown_event.is_set(): 
-                        await asyncio.to_thread(stream.write, bytestream)
-                    else:
-                        # print("AudioLoop: Shutdown signaled in play_audio, not writing.") # Less verbose
-                        break
-                except asyncio.TimeoutError:
-                    continue 
-                except Exception as e:
-                    if not self._shutdown_event.is_set():
-                        print(f"AudioLoop: Error in play_audio: {e}")
-                    await asyncio.sleep(0.1) 
+                # Loop just sleeps to keep the task alive if it's still in the task group.
+                # Or this task could be removed entirely if not needed for other coordination.
+                await asyncio.sleep(0.5) 
+                if self._shutdown_event.is_set():
+                    break
+        except asyncio.CancelledError:
+            # print("AudioLoop: play_audio task cancelled.")
+            pass
+        except Exception as e:
+            if not self._shutdown_event.is_set():
+                print(f"AudioLoop: Error in play_audio (no-op) loop: {e}")
         finally:
-            if stream:
-                # print("AudioLoop: play_audio finally: Closing audio output stream...") # Less verbose
-                try:
-                    await asyncio.to_thread(stream.stop_stream)
-                    await asyncio.to_thread(stream.close)
-                    # print("AudioLoop: play_audio finally: Audio output stream closed.") # Less verbose
-                except Exception as e:
-                     print(f"AudioLoop: play_audio finally: Error closing output stream: {e}")
-            # print("AudioLoop: play_audio finished.") # Less verbose
+            # print("AudioLoop: play_audio (no-op) finished.")
             pass
 
     async def run(self):
@@ -425,8 +410,8 @@ class AudioLoop:
                      self._shutdown_event.set() # Force shutdown if this essential queue is missing
                      raise ValueError("webrtc_audio_input_queue not provided to AudioLoop")
 
-                self.audio_in_queue = asyncio.Queue() # For Gemini audio output
-                self.out_queue = asyncio.Queue(maxsize=50)  # For processed WebRTC audio to Gemini
+                # self.audio_in_queue = asyncio.Queue() # MODIFIED: Removed, replaced by model_audio_output_queue
+                self.out_queue = asyncio.Queue(maxsize=50)
 
                 async with asyncio.TaskGroup() as tg:
                     print("AudioLoop: Creating tasks within TaskGroup...")
@@ -456,7 +441,8 @@ class AudioLoop:
 
             # print("AudioLoop: Placing sentinels on all queues to unblock any waiting tasks...") # Less verbose
             if self.user_text_input_queue: self.user_text_input_queue.put_nowait(None)
-            if self.audio_in_queue: self.audio_in_queue.put_nowait(None)
+            # if self.audio_in_queue: self.audio_in_queue.put_nowait(None) # MODIFIED: Removed
+            if self.model_audio_output_queue: self.model_audio_output_queue.put_nowait(None) # MODIFIED: Add sentinel for new queue
             if self.out_queue: self.out_queue.put_nowait(None)
             if self.model_text_output_queue: self.model_text_output_queue.put_nowait(None) 
             
@@ -478,9 +464,9 @@ class AudioLoop:
                 # print("AudioLoop: Gemini session should be closed by 'async with' context manager.") # Less verbose
                 self.session = None 
             
-            print("AudioLoop: Terminating self.pya (PyAudio instance)...")
+            print("AudioLoop: Terminating self.pya (PyAudio instance)...") # Will be None now
             try:
-                if self.pya: 
+                if self.pya: # pya will be None, so this block won't run
                     await asyncio.to_thread(self.pya.terminate) 
                     print("AudioLoop: self.pya (PyAudio instance) terminated successfully.")
             except Exception as e:
@@ -504,9 +490,35 @@ async def handle_tool_call(session, server_tool_call: types.LiveServerToolCall):
             tool_result_dict = None 
             try:
                 if tool_name == "turn_office_light_on":
-                    tool_result_dict = turn_office_light_on()
+                    # tool_result_dict = turn_office_light_on() # Old call
+                    tool_result_dict = control_light(light_name="Office Lamp", action="ON")
                 elif tool_name == "turn_office_light_off":
-                    tool_result_dict = turn_office_light_off()
+                    # tool_result_dict = turn_office_light_off() # Old call
+                    tool_result_dict = control_light(light_name="Office Lamp", action="OFF")
+                elif tool_name == "control_light":
+                    light_name_arg = fc.args.get("light_name")
+                    action_arg = fc.args.get("action")
+                    brightness_arg = fc.args.get("brightness_percent") # This might be None
+
+                    if not light_name_arg or not action_arg:
+                        tool_result_dict = {"status": "error", "message": "Missing required arguments 'light_name' or 'action' for control_light."}
+                        print(tool_result_dict["message"]) 
+                    else:
+                        print(f"Calling control_light with: name='{light_name_arg}', action='{action_arg}', brightness={brightness_arg}")
+                        # Ensure brightness_arg is int if present, or None
+                        if brightness_arg is not None:
+                            try:
+                                brightness_arg = int(brightness_arg)
+                            except ValueError:
+                                tool_result_dict = {"status": "error", "message": f"Invalid brightness_percent value: {brightness_arg}. Must be a number."}
+                                print(tool_result_dict["message"]) 
+                        
+                        if not tool_result_dict: # Only call if brightness conversion was okay or not needed
+                            tool_result_dict = control_light(
+                                light_name=light_name_arg, 
+                                action=action_arg, 
+                                brightness_percent=brightness_arg
+                            )
                 else:
                     tool_result_dict = {"status": "error", "message": f"Tool '{tool_name}' not found."}
                     print(tool_result_dict["message"])

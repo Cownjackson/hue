@@ -2,8 +2,8 @@ import streamlit as st
 import asyncio
 import threading
 from queue import Queue as ThreadQueue
-from google_ai_sample import AudioLoop # Assuming types and other necessary components are accessible or re-imported if needed
-from streamlit_webrtc import webrtc_streamer, AudioProcessorBase, WebRtcMode
+from google_ai_sample import AudioLoop, RECEIVE_SAMPLE_RATE, CHANNELS as GEMINI_OUTPUT_CHANNELS # Import rate and channels for Gemini output
+from streamlit_webrtc import webrtc_streamer, AudioProcessorBase, WebRtcMode, RTCConfiguration
 import numpy as np
 import librosa
 import av # For av.AudioFrame
@@ -13,7 +13,7 @@ import av # For av.AudioFrame
 # A cleaner way would be to manage the PyAudio instance within AudioLoop and ensure its cleanup.
 # For now, we rely on AudioLoop's cleanup.
 
-def run_audioloop_in_thread(audioloop_instance, streamlit_user_q, streamlit_model_q, webrtc_audio_q):
+def run_audioloop_in_thread(audioloop_instance, streamlit_user_q, streamlit_model_q, webrtc_audio_q, model_audio_output_q_from_st):
     """Target function for the AudioLoop thread."""
     # Create a new event loop for this thread
     loop = asyncio.new_event_loop()
@@ -23,8 +23,9 @@ def run_audioloop_in_thread(audioloop_instance, streamlit_user_q, streamlit_mode
     audioloop_instance.user_text_input_queue = streamlit_user_q
     audioloop_instance.model_text_output_queue = streamlit_model_q
     audioloop_instance.webrtc_audio_input_queue = webrtc_audio_q # Assign the WebRTC audio queue
+    audioloop_instance.model_audio_output_queue = model_audio_output_q_from_st # Assign the new queue
     
-    print("Starting AudioLoop.run() in a new thread...")
+    print("Starting AudioLoop.run() in a new thread with model_audio_output_queue...")
     try:
         loop.run_until_complete(audioloop_instance.run())
     except Exception as e:
@@ -46,12 +47,15 @@ if 'audioloop_running' not in st.session_state:
     st.session_state.user_text_input_queue = asyncio.Queue()
     st.session_state.model_text_output_queue = asyncio.Queue()
     st.session_state.webrtc_audio_queue = asyncio.Queue() # Initialize WebRTC audio queue here
+    st.session_state.model_audio_output_queue = asyncio.Queue() # New queue for audio from Gemini to browser
     st.session_state.conversation_history = []
     st.session_state.stop_requested = False
 
 TARGET_SAMPLE_RATE = 16000 # For Gemini
 # PYAUDIO_FORMAT = pyaudio.paInt16 # No longer needed
 # PYAUDIO_CHANNELS = 1 # No longer needed
+
+TARGET_MIC_INPUT_SAMPLE_RATE = 16000
 
 class WebRTCAudioRelay(AudioProcessorBase):
     def __init__(self, output_queue: asyncio.Queue): 
@@ -111,9 +115,9 @@ class WebRTCAudioRelay(AudioProcessorBase):
             if mono_audio.size == 0:
                 continue
 
-            if frame.sample_rate != TARGET_SAMPLE_RATE:
+            if frame.sample_rate != TARGET_MIC_INPUT_SAMPLE_RATE:
                 try:
-                    resampled_audio = librosa.resample(mono_audio, orig_sr=frame.sample_rate, target_sr=TARGET_SAMPLE_RATE)
+                    resampled_audio = librosa.resample(mono_audio, orig_sr=frame.sample_rate, target_sr=TARGET_MIC_INPUT_SAMPLE_RATE)
                 except Exception as e:
                     # print(f"WebRTCAudioRelay: Error during resampling: {e}...") # Original commented print
                     continue
@@ -137,10 +141,84 @@ class WebRTCAudioRelay(AudioProcessorBase):
         # print("WebRTCAudioRelay __del__ called.") # Less verbose
         pass
 
+class AudioPlayerProcessor(AudioProcessorBase):
+    def __init__(self, model_audio_q: asyncio.Queue, target_sample_rate: int, target_channels: int):
+        self.model_audio_q = model_audio_q
+        self.target_sample_rate = target_sample_rate
+        self.target_channels = target_channels
+        self.audio_buffer = bytearray() # Buffer for incomplete audio frames
+        # Each audio frame for playback should ideally represent a fixed duration, e.g., 20ms.
+        # For 24kHz, 16-bit mono, 20ms = 0.02s * 24000 samples/s * 1 channel * 2 bytes/sample = 960 bytes.
+        self.bytes_per_20ms_frame = int(0.02 * self.target_sample_rate * self.target_channels * 2)
+        self.phase = 0  # For tone generation
+        self.frequency = 440  # Hz (A4 note)
+        print(f"AudioPlayerProcessor initialized for TONE TEST. Target SR: {target_sample_rate}, Channels: {target_channels}, Bytes/Frame: {self.bytes_per_20ms_frame}")
+
+    async def recv(self):
+        # --- TONE GENERATION TEST --- 
+        # print("AudioPlayerProcessor: recv() TONE TEST")
+        samples_per_frame = self.bytes_per_20ms_frame // (self.target_channels * 2) # 2 bytes/sample (int16)
+        
+        t = (np.arange(samples_per_frame) + self.phase) / self.target_sample_rate
+        tone = (0.3 * np.sin(2 * np.pi * self.frequency * t) * 32767).astype(np.int16) # 0.3 amplitude
+        self.phase += samples_per_frame
+
+        if self.target_channels == 1:
+            audio_np_reshaped = tone.reshape(1, -1) # (1, num_samples)
+        else: # Crude stereo, just duplicate mono
+            audio_np_reshaped = np.vstack([tone, tone]).reshape(self.target_channels, -1, order='F')
+
+        # print(f"AudioPlayerProcessor (TONE TEST): Sending tone frame {audio_np_reshaped.shape[1]} samples.")
+        return av.AudioFrame.from_ndarray(audio_np_reshaped, format='s16', layout='mono' if self.target_channels == 1 else 'stereo', sample_rate=self.target_sample_rate)
+        # --- END TONE GENERATION TEST ---
+
+        # Original queue logic (commented out for tone test):
+        # # print(\"AudioPlayerProcessor: recv() called\") 
+        # # Try to get some data from the queue to fill the buffer
+        # try:
+        #     # Consume available data from the queue without blocking indefinitely
+        #     # but wait a very short period if empty to catch data just arriving.
+        #     chunk = await asyncio.wait_for(self.model_audio_q.get(), timeout=0.015) # Increased timeout
+        #     if chunk is None: # Sentinel
+        #         return av.AudioFrame(format=\'s16\', layout=\'mono\', samples=0, sample_rate=self.target_sample_rate)
+        #     self.audio_buffer.extend(chunk)
+        #     self.model_audio_q.task_done()
+        #     while not self.model_audio_q.empty():
+        #         try:
+        #             chunk = self.model_audio_q.get_nowait()
+        #             if chunk is None: break 
+        #             self.audio_buffer.extend(chunk)
+        #             self.model_audio_q.task_done()
+        #         except asyncio.QueueEmpty:
+        #             break
+        # except asyncio.TimeoutError:
+        #     pass 
+        # except Exception as e:
+        #     print(f\"AudioPlayerProcessor: Error getting from model_audio_q: {e}\")
+
+        # if len(self.audio_buffer) >= self.bytes_per_20ms_frame:
+        #     frame_data_bytes = self.audio_buffer[:self.bytes_per_20ms_frame]
+        #     self.audio_buffer = self.audio_buffer[self.bytes_per_20ms_frame:]
+        #     audio_np = np.frombuffer(frame_data_bytes, dtype=np.int16)
+        #     if self.target_channels == 1:
+        #         audio_np_reshaped = audio_np.reshape(1, -1) 
+        #     else: 
+        #         audio_np_reshaped = audio_np.reshape(self.target_channels, -1, order=\'F\')
+        #     print(f\"AudioPlayerProcessor: Sending audio frame to browser ({audio_np_reshaped.shape[1]} samples per channel).\")
+        #     return av.AudioFrame.from_ndarray(audio_np_reshaped, format=\'s16\', layout=\'mono\' if self.target_channels == 1 else \'stereo\', sample_rate=self.target_sample_rate)
+        
+        # silent_samples_per_channel = self.bytes_per_20ms_frame // (self.target_channels * 2)
+        # return av.AudioFrame(format=\'s16\', layout=\'mono\' if self.target_channels == 1 else \'stereo\', samples=silent_samples_per_channel, sample_rate=self.target_sample_rate)
+
 # Factory creator for WebRTCAudioRelay
 def create_webrtc_audio_relay_factory(queue_instance: asyncio.Queue):
     def factory():
         return WebRTCAudioRelay(output_queue=queue_instance)
+    return factory
+
+def create_audio_player_factory(model_audio_q: asyncio.Queue):
+    def factory():
+        return AudioPlayerProcessor(model_audio_q=model_audio_q, target_sample_rate=RECEIVE_SAMPLE_RATE, target_channels=GEMINI_OUTPUT_CHANNELS)
     return factory
 
 def start_audioloop():
@@ -150,12 +228,14 @@ def start_audioloop():
         st.session_state.user_text_input_queue = asyncio.Queue()
         st.session_state.model_text_output_queue = asyncio.Queue()
         st.session_state.webrtc_audio_queue = asyncio.Queue() # Also re-initialize here for a clean start
+        st.session_state.model_audio_output_queue = asyncio.Queue() # Ensure it's fresh
         st.session_state.conversation_history = [] # Clear history for new session
 
         st.session_state.audioloop_instance = AudioLoop(
             user_text_input_queue=st.session_state.user_text_input_queue,
             model_text_output_queue=st.session_state.model_text_output_queue,
-            webrtc_audio_input_queue=st.session_state.webrtc_audio_queue 
+            webrtc_audio_input_queue=st.session_state.webrtc_audio_queue,
+            model_audio_output_queue=st.session_state.model_audio_output_queue # Pass new queue
         )
         
         st.session_state.audioloop_thread = threading.Thread(
@@ -164,7 +244,8 @@ def start_audioloop():
                 st.session_state.audioloop_instance,
                 st.session_state.user_text_input_queue,
                 st.session_state.model_text_output_queue,
-                st.session_state.webrtc_audio_queue # Pass the queue to the thread function
+                st.session_state.webrtc_audio_queue,
+                st.session_state.model_audio_output_queue # Pass new queue to thread function
             ),
             daemon=True 
         )
@@ -223,7 +304,7 @@ with col2:
         # While stopping, show a disabled-like state or a message
         st.button("Processing Stop...", disabled=True)
     
-    st.caption("Audio I/O uses server's default devices for output, browser microphone for input.")
+    st.caption("Audio I/O uses browser microphone and speakers.")
 
     # Add WebRTC streamer
     st.subheader("Microphone Input (Browser)")
@@ -254,6 +335,24 @@ with col2:
          else:
             st.warning("Microphone is not currently active or sending data. Click 'START' above if available.")
 
+    st.subheader("Audio Output (Browser)")
+    if not st.session_state.audioloop_running:
+        st.info("Start Voice Agent Service to enable audio output.")
+        # Optional: could render a disabled player cosmetic here if desired
+    else:
+        webrtc_player_ctx = webrtc_streamer(
+            key="audioloop-webrtc-speaker-enabled",
+            mode=WebRtcMode.RECVONLY,
+            audio_processor_factory=create_audio_player_factory(st.session_state.model_audio_output_queue),
+            rtc_configuration={"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]},
+            media_stream_constraints={"video": False, "audio": True}, # Audio is true, even for RECVONLY to enable playback path
+            desired_playing_state=st.session_state.audioloop_running 
+        )
+        if webrtc_player_ctx.state.playing:
+            st.success("Audio output is active.")
+        else:
+            st.warning("Audio output not active. Check browser or connection.")
+
 with col1:
     st.subheader("Conversation")
     chat_placeholder = st.empty() 
@@ -266,7 +365,7 @@ with col1:
         if st.session_state.audioloop_running and st.session_state.user_text_input_queue:
             st.session_state.conversation_history.append(("You", user_input))
             st.session_state.user_text_input_queue.put_nowait(user_input)
-            # No st.rerun() needed here immediately, update will happen via polling or next interaction
+            st.rerun() # Ensure UI updates to show user's message
         elif not st.session_state.audioloop_running:
             st.error("Voice Agent not running. Please start it.")
 
@@ -296,6 +395,7 @@ if st.session_state.audioloop_running:
                     pass 
                 break 
             st.session_state.conversation_history.append(("Gemini", model_response))
+            print(f"Streamlit UI: Added Gemini response to history: '{model_response[:100]}...'")
             model_message_received = True
     except asyncio.QueueEmpty: 
         pass
