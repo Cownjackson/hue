@@ -1,1 +1,10 @@
-requests>=2.25.0 
+requests>=2.25.0
+google-genai
+opencv-python
+pyaudio
+Pillow
+mss
+python-dotenv
+fastapi
+uvicorn[standard]
+# pydub # No longer used for client audio to Gemini 

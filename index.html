@@ -1,0 +1,295 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Hue Voice Assistant</title>
+    <style>
+        body { font-family: sans-serif; margin: 20px; background-color: #f4f4f4; color: #333; }
+        .container { max-width: 600px; margin: auto; background-color: #fff; padding: 20px; border-radius: 8px; box-shadow: 0 0 10px rgba(0,0,0,0.1); }
+        #status { margin-bottom: 15px; font-style: italic; color: #555; }
+        #messages { height: 200px; overflow-y: scroll; border: 1px solid #ddd; padding: 10px; margin-bottom: 15px; background-color: #fafafa; }
+        .message { margin-bottom: 8px; padding: 5px; border-radius: 4px; }
+        .message.user { background-color: #e1f5fe; text-align: right; }
+        .message.assistant { background-color: #f1f8e9; }
+        .message.system { background-color: #eee; font-style: italic; font-size: 0.9em; }
+        .controls button, .text-input button {
+            padding: 10px 15px; margin: 5px; border: none; border-radius: 4px; cursor: pointer; font-size: 1em;
+        }
+        .controls button:disabled { background-color: #ccc; cursor: not-allowed; }
+        #connectButton { background-color: #4CAF50; color: white; }
+        #disconnectButton { background-color: #f44336; color: white; }
+        #startButton { background-color: #2196F3; color: white; }
+        #stopButton { background-color: #FF9800; color: white; }
+        .text-input { display: flex; margin-top: 10px; }
+        .text-input input { flex-grow: 1; padding: 10px; border: 1px solid #ddd; border-radius: 4px 0 0 4px; }
+        .text-input button { border-radius: 0 4px 4px 0; background-color: #607D8B; color: white; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Hue Voice Assistant</h1>
+        <div id="status">Not connected.</div>
+        
+        <div class="controls">
+            <button id="connectButton">Connect</button>
+            <button id="disconnectButton" disabled>Disconnect</button>
+            <button id="startButton" disabled>Start Listening</button>
+            <button id="stopButton" disabled>Stop Listening</button>
+        </div>
+
+        <div id="messages"></div>
+
+        <div class="text-input">
+            <input type="text" id="textInput" placeholder="Type message here..." disabled>
+            <button id="sendTextButton" disabled>Send</button>
+        </div>
+    </div>
+
+    <script>
+        const connectButton = document.getElementById('connectButton');
+        const disconnectButton = document.getElementById('disconnectButton');
+        const startButton = document.getElementById('startButton');
+        const stopButton = document.getElementById('stopButton');
+        const textInput = document.getElementById('textInput');
+        const sendTextButton = document.getElementById('sendTextButton');
+        const statusDiv = document.getElementById('status');
+        const messagesDiv = document.getElementById('messages');
+
+        let websocket = null;
+        let mediaRecorder = null;
+        let audioChunks = [];
+        
+        let audioContext; // For playing back received audio
+        const CHUNK_DURATION_MS = 200; // How often to send audio data
+        const TARGET_SAMPLE_RATE = 16000; // For sending to Gemini
+        const PLAYBACK_SAMPLE_RATE = 24000; // Gemini sends audio at 24kHz
+
+        // Try to use WAV first, as it might be easier to process in chunks or by pydub
+        // Fallback to webm/opus if wav is not supported
+        const preferredMimeTypes = [
+            'audio/wav', // Potentially 16-bit PCM, easier to handle if supported
+            'audio/webm;codecs=opus',
+            'audio/ogg;codecs=opus', // Fallback
+            'audio/aac', // Another fallback
+            '' // Default
+        ];
+        let actualMimeType = '';
+
+        let ws;
+        const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        let audioPlaybackQueue = [];
+        let isPlayingFromServerAudio = false;
+
+        function logMessage(message, type = 'info') {
+            const p = document.createElement('p');
+            p.textContent = message;
+            p.className = `message ${type}`;
+            messagesDiv.appendChild(p);
+            messagesDiv.scrollTop = messagesDiv.scrollHeight;
+        }
+
+        function updateUIState(isConnected, isRecording = false) {
+            connectButton.disabled = isConnected;
+            disconnectButton.disabled = !isConnected;
+            startButton.disabled = !isConnected || isRecording;
+            stopButton.disabled = !isConnected || !isRecording;
+            textInput.disabled = !isConnected;
+            sendTextButton.disabled = !isConnected;
+        }
+
+        connectButton.onclick = () => {
+            // Replace with your server's actual IP if not localhost
+            // If your server is on a different machine, use ws://<server_ip>:8000/ws/voice
+            // For testing on the same machine:
+            const wsUrl = `ws://${window.location.hostname}:8000/ws/voice`; 
+            statusDiv.textContent = `Connecting to ${wsUrl}...`;
+            websocket = new WebSocket(wsUrl);
+
+            websocket.onopen = () => {
+                statusDiv.textContent = 'Connected. Ready to interact.';
+                logMessage('WebSocket connection established.', 'system');
+                updateUIState(true);
+                if (!audioContext) { // Initialize AudioContext on first successful connection
+                    audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: PLAYBACK_SAMPLE_RATE });
+                }
+            };
+
+            websocket.onmessage = async event => {
+                if (event.data instanceof ArrayBuffer) { // Audio from server (raw PCM)
+                    audioPlaybackQueue.push(event.data);
+                    if (audioCtx.state === 'suspended') {
+                         audioCtx.resume().then(() => {
+                            playNextInServerAudioQueue();
+                         });
+                    } else {
+                        playNextInServerAudioQueue();
+                    }
+                } else if (typeof event.data === 'string') {
+                    try {
+                        const message = JSON.parse(event.data);
+                        if (message.type === 'text_response') {
+                            logMessage(message.text, 'assistant');
+                        } else {
+                            // If JSON but not the expected type, log raw data as system message
+                            logMessage(event.data, 'system'); 
+                        }
+                    } catch (e) {
+                        // If JSON.parse fails, assume it's a plain text message (e.g., system status)
+                        logMessage(event.data, 'system'); 
+                        // console.error('Error parsing server message:', e); // Optional: for debugging if unexpected non-JSON strings appear
+                    }
+                }
+            };
+
+            websocket.onerror = (error) => {
+                console.error('WebSocket Error:', error);
+                statusDiv.textContent = 'WebSocket error. See console.';
+                logMessage('WebSocket error. Check console.', 'system');
+                updateUIState(false);
+            };
+
+            websocket.onclose = (event) => {
+                statusDiv.textContent = 'Disconnected.';
+                logMessage(`WebSocket connection closed. Code: ${event.code}, Reason: ${event.reason || 'N/A'}`, 'system');
+                updateUIState(false);
+                if (mediaRecorder && mediaRecorder.state === "recording") {
+                    mediaRecorder.stop();
+                }
+                websocket = null;
+            };
+        };
+
+        disconnectButton.onclick = () => {
+            if (websocket) {
+                websocket.close();
+            }
+            updateUIState(false);
+        };
+
+        startButton.onclick = async () => {
+            if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+                logMessage('getUserMedia not supported on your browser!', 'system');
+                statusDiv.textContent = 'Error: Mic access not supported.';
+                return;
+            }
+            try {
+                const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                
+                actualMimeType = preferredMimeTypes.find(type => !type || MediaRecorder.isTypeSupported(type));
+                if (!actualMimeType && preferredMimeTypes.includes('')) actualMimeType = ''; //Handles the default case explicitly if others fail
+
+                logMessage("System: Microphone access granted.");
+                // mediaRecorder = new MediaRecorder(stream, { mimeType: preferredMimeType });
+                const options = actualMimeType ? { mimeType: actualMimeType } : {};
+                mediaRecorder = new MediaRecorder(stream, options);
+
+                console.log('MediaRecorder initialized.');
+                // console.log('Attempting to use MIME type:', preferredMimeType); // This was the old log
+                console.log('Attempting to use preferred MIME types (first supported):', preferredMimeTypes);
+                console.log('Actual MediaRecorder MIME type being used:', mediaRecorder.mimeType); 
+                logMessage(`System: Recording with MIME type: ${mediaRecorder.mimeType}`);
+
+                mediaRecorder.ondataavailable = async event => { // Made async for await
+                    if (event.data.size > 0) {
+                        if (websocket && websocket.readyState === WebSocket.OPEN) {
+                            try {
+                                const arrayBuffer = await event.data.arrayBuffer(); // Convert Blob to ArrayBuffer
+                                websocket.send(arrayBuffer);
+                                // console.log('Sent audio data chunk (as ArrayBuffer) to WebSocket.');
+                            } catch (error) {
+                                console.error('Error converting Blob to ArrayBuffer or sending:', error);
+                                logMessage('Error sending audio data.', 'error');
+                            }
+                        }
+                    }
+                };
+
+                mediaRecorder.onstop = () => {
+                    statusDiv.textContent = 'Recording stopped.';
+                    logMessage('Recording stopped.', 'system');
+                    stream.getTracks().forEach(track => track.stop()); // Release microphone
+                    updateUIState(true, false);
+                    // No need to send a large concatenated blob if we are streaming chunks
+                };
+                
+                // Start recording and send data in time slices
+                mediaRecorder.start(CHUNK_DURATION_MS); 
+
+            } catch (err) {
+                console.error('Error accessing microphone or starting recorder:', err);
+                statusDiv.textContent = 'Error accessing microphone.';
+                logMessage(`Error accessing microphone: ${err.message}`, 'system');
+                updateUIState(true, false); // Back to connected, not recording
+            }
+        };
+
+        stopButton.onclick = () => {
+            if (mediaRecorder && mediaRecorder.state === "recording") {
+                mediaRecorder.stop();
+                // The onstop event will handle UI updates and releasing mic.
+            }
+        };
+
+        sendTextButton.onclick = () => {
+            const text = textInput.value;
+            if (text && websocket && websocket.readyState === WebSocket.OPEN) {
+                websocket.send(text);
+                logMessage(text, 'user');
+                textInput.value = '';
+            }
+        };
+        textInput.addEventListener('keypress', (event) => {
+            if (event.key === 'Enter') {
+                sendTextButton.click();
+            }
+        });
+
+        function playNextInServerAudioQueue() {
+            if (isPlayingFromServerAudio || audioPlaybackQueue.length === 0 || !audioCtx) {
+                return;
+            }
+            isPlayingFromServerAudio = true;
+            const arrayBuffer = audioPlaybackQueue.shift();
+
+            // Assuming PCM data is Int16, 1 channel, 24000 Hz based on server/Gemini config
+            const pcmData = new Int16Array(arrayBuffer);
+            const float32Data = new Float32Array(pcmData.length);
+            for (let i = 0; i < pcmData.length; i++) {
+                float32Data[i] = pcmData[i] / 32767.0; // Convert Int16 to Float32 range [-1.0, 1.0]
+            }
+
+            if (float32Data.length === 0) {
+                console.warn("Received empty audio buffer, skipping playback.");
+                isPlayingFromServerAudio = false;
+                playNextInServerAudioQueue();
+                return;
+            }
+
+            try {
+                const audioBuffer = audioCtx.createBuffer(1, float32Data.length, 24000); // 1 channel, 24kHz
+                audioBuffer.copyToChannel(float32Data, 0);
+
+                const source = audioCtx.createBufferSource();
+                source.buffer = audioBuffer;
+                source.connect(audioCtx.destination);
+                source.onended = () => {
+                    // console.log("Finished playing server audio chunk.");
+                    isPlayingFromServerAudio = false;
+                    playNextInServerAudioQueue(); // Check for more in queue
+                };
+                source.start();
+            } catch (e) {
+                console.error("Error playing server audio:", e);
+                logMessage(`Error playing audio: ${e.message}`, 'error');
+                isPlayingFromServerAudio = false;
+                playNextInServerAudioQueue(); // Attempt to play next if error on current
+            }
+        }
+        
+        // Initial UI state
+        updateUIState(false);
+
+    </script>
+</body>
+</html> 
