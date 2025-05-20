@@ -95,15 +95,16 @@ class AudioLoop:
         self.webrtc_audio_input_queue = webrtc_audio_input_queue
         self.model_audio_output_queue = model_audio_output_queue # Store new queue
         
-        self.pya = None # PyAudio instance removed from direct init
-        # self.audio_in_queue = None  # Replaced by model_audio_output_queue
-        self.out_queue = None       # For audio from mic (WebRTC) to be sent to Gemini
+        self.pya = None # PyAudio instance for OUTPUT removed
+        self.audio_stream = None # For INPUT if using PyAudio, not for output
+        self.out_queue = None       # For audio from mic (WebRTC or PyAudio) to be sent to Gemini
 
         self.session = None
         self._shutdown_event = asyncio.Event()
         self._tasks = []
     
-    # _initialize_pyaudio_if_needed method removed
+    # _initialize_pyaudio_if_needed method should only handle input if PyAudio mic is used.
+    # For this WebRTC setup, it's not strictly needed for input either.
 
     async def _shutdown_monitor(self):
         await self._shutdown_event.wait()  
@@ -293,102 +294,93 @@ class AudioLoop:
             print("AudioLoop: listen_audio (New Pause Detection Logic) finished.")
 
     async def receive_audio(self):
-        # print("AudioLoop: receive_audio started.") # Less verbose
+        # print("AudioLoop: receive_audio started (Reverted to __anext__ pattern).") 
         try:
             while not self._shutdown_event.is_set():
                 if not self.session:
-                    await asyncio.sleep(0.1) 
+                    await asyncio.sleep(0.1)
                     continue
+
                 try:
                     response_message_iterator = self.session.receive()
                     response_message = await asyncio.wait_for(response_message_iterator.__anext__(), timeout=0.5)
-                    # print(f"AudioLoop: receive_audio got response_message: {type(response_message)}") # Less verbose
                     
+                    if self._shutdown_event.is_set():
+                        break
+
                     if server_tool_call := response_message.tool_call:
-                        # print(f"AudioLoop: receive_audio processing tool_call: {server_tool_call}") # Keep, important event
-                        await handle_tool_call(self.session, server_tool_call)
+                        # print(f"AudioLoop: receive_audio processing tool_call: {server_tool_call}")
+                        asyncio.create_task(handle_tool_call(self.session, server_tool_call))
                         continue
 
-                    if server_content := response_message.server_content:
-                        # print(f"AudioLoop: receive_audio processing server_content. Turn complete: {server_content.turn_complete}, Interrupted: {server_content.interrupted}") # Less verbose
-                        if model_turn_content := server_content.model_turn:
-                            # print(f"AudioLoop: receive_audio got model_turn_content with {len(model_turn_content.parts)} parts.") # Less verbose
-                            for i, part in enumerate(model_turn_content.parts):
-                                if self._shutdown_event.is_set(): break
-                                if part.text:
-                                    # print(f"AudioLoop: receive_audio part {i} is text: '{part.text[:100]}...'") # Less verbose
-                                    if self.model_text_output_queue:
-                                        self.model_text_output_queue.put_nowait(part.text)
-                                    else: 
-                                        if not self._shutdown_event.is_set(): print(part.text, end="", flush=True)
-                                elif part.inline_data and part.inline_data.data:
-                                    print(f"AudioLoop: receive_audio: Got audio data from Gemini ({len(part.inline_data.data)} bytes), queuing for browser.") # Key log added
-                                    if self.model_audio_output_queue: # MODIFIED: Use new queue
-                                        self.model_audio_output_queue.put_nowait(part.inline_data.data)
-                                    else:
-                                        print("AudioLoop: model_audio_output_queue not available to send audio data.")
-                                elif exec_result := part.code_execution_result:
-                                    outcome_str = exec_result.outcome if exec_result.outcome else "UNSPECIFIED"
-                                    output_str = exec_result.output if exec_result.output else ""
-                                    msg = f"\n[Code Execution Result From Server]: Outcome: {outcome_str}, Output: \"{output_str}\""
-                                    # print(f"AudioLoop: receive_audio part {i} is code_execution_result: {msg}") # Keep, important event
-                                    if self.model_text_output_queue:
-                                        self.model_text_output_queue.put_nowait(msg)
-                                    else:
-                                        if not self._shutdown_event.is_set(): print(msg, flush=True)
-                                else:
-                                    # print(f"AudioLoop: receive_audio part {i} is of an unknown type or empty. Part details: {part}") # Less verbose
-                                    pass 
-                            if self.model_text_output_queue and server_content.turn_complete:
-                                # print("AudioLoop: receive_audio model turn complete.") # Less verbose
-                                pass 
+                    text_for_this_response = []
+
+                    for part in response_message.parts:
+                        if part.audio and self.model_audio_output_queue:
+                            audio_data = part.audio
+                            print(f"!!!!!!!! AudioLoop: receive_audio: Got {len(audio_data)} AUDIO bytes from Gemini. Queue ID: {id(self.model_audio_output_queue)} !!!!!!!!")
+                            try:
+                                self.model_audio_output_queue.put_nowait(audio_data)
+                                print(f"!!!!!!!! AudioLoop: receive_audio: Successfully PUT {len(audio_data)} AUDIO bytes onto model_audio_output_queue. QSIZE: {self.model_audio_output_queue.qsize()} !!!!!!!!")
+                            except asyncio.QueueFull:
+                                print("!!!!!!!! AudioLoop: receive_audio: model_audio_output_queue is FULL. Discarding audio. !!!!!!!!")
+                            except Exception as e:
+                                print(f"!!!!!!!! AudioLoop: receive_audio: ERROR putting to model_audio_output_queue: {e} !!!!!!!!")
+                        if part.text:
+                            text_for_this_response.append(part.text)
                         
-                        if server_content.interrupted:
-                            msg = "\n[Playback Interrupted by Server Signal]"
-                            print("AudioLoop: receive_audio server_content.interrupted is true.") # Keep, important event
-                            if self.model_text_output_queue:
-                                self.model_text_output_queue.put_nowait(msg)
-                            else:
-                                if not self._shutdown_event.is_set(): print(msg, flush=True)
-                            if self.model_audio_output_queue: # MODIFIED: Clear new queue
-                                while not self.model_audio_output_queue.empty():
-                                    try: self.model_audio_output_queue.get_nowait()
-                                    except asyncio.QueueEmpty: break
+                        if hasattr(part, 'code_execution_result') and part.code_execution_result:
+                            exec_result = part.code_execution_result
+                            outcome_str = exec_result.outcome if exec_result.outcome else "UNSPECIFIED"
+                            output_bytes = exec_result.output if exec_result.output else b''
+                            try:
+                                output_str = output_bytes.decode('utf-8', errors='replace')
+                            except AttributeError:
+                                output_str = str(output_bytes)
+
+                            msg = f"\n[Code Execution Result From Server]: Outcome: {outcome_str}, Output: \"{output_str}\""
+                            text_for_this_response.append(msg)
+
+                    if text_for_this_response and self.model_text_output_queue:
+                        full_text_message = "".join(text_for_this_response)
+                        try:
+                            self.model_text_output_queue.put_nowait(full_text_message)
+                        except asyncio.QueueFull:
+                            print("AudioLoop: receive_audio: model_text_output_queue is FULL. Discarding text message.")
+                        except Exception as e:
+                            print(f"AudioLoop: receive_audio: Error putting to model_text_output_queue: {e}")
+
                 except asyncio.TimeoutError:
                     continue 
                 except StopAsyncIteration: 
                     if not self._shutdown_event.is_set(): 
-                        print("AudioLoop: session.receive() iterator finished unexpectedly.")
-                        self._shutdown_event.set() 
+                        print("AudioLoop: receive_audio: Model stream ended (StopAsyncIteration).")
+                    await asyncio.sleep(0.1)
+                    continue
+                except types.live_connect.StreamClosedError as e: # Specific error for stream closure
+                    print(f"AudioLoop: receive_audio: StreamClosedError: {e}. Signaling shutdown.")
+                    self._shutdown_event.set()
                     break
                 except Exception as e:
                     if not self._shutdown_event.is_set():
                         print(f"AudioLoop: Error in receive_audio: {e}")
-                        self._shutdown_event.set() 
-                    break 
+                    await asyncio.sleep(0.1)
+        
         finally:
             # print("AudioLoop: receive_audio finished.") # Less verbose
             pass
 
     async def play_audio(self):
-        # print("AudioLoop: play_audio started (now a no-op for server-side PyAudio).")
-        # This method no longer plays audio directly using PyAudio.
-        # Audio is routed to model_audio_output_queue for client-side handling.
+        # This method is now a no-op. Audio received from Gemini is placed onto 
+        # self.model_audio_output_queue by the receive_audio method.
+        # print("AudioLoop: play_audio is now a no-op.") # Can enable for one-time confirmation
         try:
             while not self._shutdown_event.is_set():
-                # Loop just sleeps to keep the task alive if it's still in the task group.
-                # Or this task could be removed entirely if not needed for other coordination.
-                await asyncio.sleep(0.5) 
-                if self._shutdown_event.is_set():
-                    break
+                await asyncio.sleep(0.5) # Keep alive if part of task group, but do nothing.
         except asyncio.CancelledError:
-            # print("AudioLoop: play_audio task cancelled.")
-            pass
-        except Exception as e:
-            if not self._shutdown_event.is_set():
-                print(f"AudioLoop: Error in play_audio (no-op) loop: {e}")
+            pass # Expected on shutdown
         finally:
-            # print("AudioLoop: play_audio (no-op) finished.")
+            # print("AudioLoop: play_audio finished its no-op loop.") # Less verbose
             pass
 
     async def run(self):
